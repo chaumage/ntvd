@@ -7,6 +7,7 @@
 const std = @import("std");
 const base = @import("base");
 const spec_mod = @import("spec.zig");
+const storage_mod = @import("storage.zig");
 const plan_mod = @import("plan.zig");
 const compile_mod = @import("compile.zig");
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
@@ -15,6 +16,10 @@ const components_mod = @import("components");
 const Spec = spec_mod.Spec;
 const Plan = plan_mod.Plan;
 const Workspace = plan_mod.Workspace;
+
+/// Comfortably larger than any scenario plan; the exact size is `bytesNeeded(spec)`.
+const test_plan_bytes = 256 * 1024;
+const test_ws_bytes = 8 * 1024;
 
 /// Gravity pulls a body down along its axis while air drag (a lift surface at zero angle of
 /// attack) resists. Drag depends on velocity, which is a state of the mass: a loop closed by
@@ -73,19 +78,19 @@ pub const falling_body = struct {
     }
 };
 
-fn compileOrFail(spec: *const Spec, plan: *Plan) !void {
-    var diag: Diagnostic = .{};
-    compile_mod.compile(spec, plan, &diag) catch |err| {
+fn compileOrFail(spec: *const Spec, buffer: storage_mod.Buffer, diag: *Diagnostic) !*Plan {
+    return compile_mod.compileInto(buffer, spec, diag) catch |err| {
         std.debug.print("compile failed: {s}\n", .{diag.message()});
         return err;
     };
 }
 
 test "a physical feedback loop through a dynamic component compiles" {
-    var plan: Plan = undefined;
+    var plan_storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
     const comps = falling_body.components(falling_body.drag_surface());
     const spec = falling_body.spec(&comps);
-    try compileOrFail(&spec, &plan);
+    const plan = try compileOrFail(&spec, &plan_storage, &diag);
 
     try std.testing.expectEqual(@as(u16, 3), plan.n_nodes);
     try std.testing.expectEqual(@as(u16, 2), plan.n_states);
@@ -101,25 +106,27 @@ test "a physical feedback loop through a dynamic component compiles" {
 }
 
 test "the right-hand side of the falling body matches the hand calculation" {
-    var plan: Plan = undefined;
+    var plan_storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
     const comps = falling_body.components(falling_body.drag_surface());
     const spec = falling_body.spec(&comps);
-    try compileOrFail(&spec, &plan);
+    const plan = try compileOrFail(&spec, &plan_storage, &diag);
+    const ws = Workspace.into(plan, &ws_storage);
 
     const weight = falling_body.mass_kg * base.units.g0;
     const ext = [_]f64{ 0.0, 0.0, weight };
-    var ws: Workspace = .{};
     var dx: [2]f64 = undefined;
 
     // At rest there is no drag: acceleration is g.
-    const v0 = plan.rhs(&.{ 0.0, 0.0 }, &ext, &ws, &dx);
+    const v0 = plan.rhs(&.{ 0.0, 0.0 }, &ext, ws, &dx);
     try std.testing.expectEqual(base.Validity.valid, v0);
     try std.testing.expectApproxEqRel(base.units.g0, dx[plan.stateIndex("body.velocity").?], 1e-12);
 
     // At terminal velocity the forces cancel.
     const vt = falling_body.terminalVelocity();
     const state = [_]f64{ vt, 0.0 };
-    _ = plan.rhs(&state, &ext, &ws, &dx);
+    _ = plan.rhs(&state, &ext, ws, &dx);
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), dx[0], 1e-9);
     try std.testing.expectApproxEqRel(vt, dx[1], 1e-12); // d(position)/dt = velocity
 }
@@ -142,14 +149,17 @@ test "swapping the model for measured data leaves the wiring untouched" {
         .cd = try Table.init(&alphas, &cds),
     } };
 
-    var plan_a: Plan = undefined;
-    var plan_m: Plan = undefined;
+    var storage_a: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var storage_m: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage_a: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage_m: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
     const comps_a = falling_body.components(analytic);
     const comps_m = falling_body.components(measured);
-    const spec_a = falling_body.spec(&comps_a);
-    const spec_m = falling_body.spec(&comps_m);
-    try compileOrFail(&spec_a, &plan_a);
-    try compileOrFail(&spec_m, &plan_m);
+    const plan_a = try compileOrFail(&falling_body.spec(&comps_a), &storage_a, &diag);
+    const plan_m = try compileOrFail(&falling_body.spec(&comps_m), &storage_m, &diag);
+    const ws_a = Workspace.into(plan_a, &ws_storage_a);
+    const ws_m = Workspace.into(plan_m, &ws_storage_m);
 
     // Same connections, same layout, same order: only the model inside one node differs.
     try std.testing.expectEqual(plan_a.n_links, plan_m.n_links);
@@ -160,15 +170,13 @@ test "swapping the model for measured data leaves the wiring untouched" {
 
     // At zero angle of attack the table holds exactly cd0, so the two agree everywhere.
     var rng = base.Rng.init(13);
-    var ws_a: Workspace = .{};
-    var ws_m: Workspace = .{};
     var dx_a: [2]f64 = undefined;
     var dx_m: [2]f64 = undefined;
     for (0..500) |_| {
         const state = [_]f64{ rng.range(0.0, 40.0), rng.range(-100.0, 100.0) };
         const ext = [_]f64{ rng.range(0.0, 3000.0), 0.0, 19.6 };
-        _ = plan_a.rhs(&state, &ext, &ws_a, &dx_a);
-        const v = plan_m.rhs(&state, &ext, &ws_m, &dx_m);
+        _ = plan_a.rhs(&state, &ext, ws_a, &dx_a);
+        const v = plan_m.rhs(&state, &ext, ws_m, &dx_m);
         try std.testing.expectEqual(base.Validity.valid, v);
         try std.testing.expectApproxEqRel(dx_a[0], dx_m[0], 1e-12);
     }
@@ -183,16 +191,18 @@ test "leaving the measured range is reported through the whole architecture" {
         .cl = try Table.init(&alphas, &.{ -0.1, 0.0, 0.1 }),
         .cd = try Table.init(&alphas, &coeffs),
     } };
-    var plan: Plan = undefined;
+    var plan_storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
     const comps = falling_body.components(narrow);
     const spec = falling_body.spec(&comps);
-    try compileOrFail(&spec, &plan);
+    const plan = try compileOrFail(&spec, &plan_storage, &diag);
+    const ws = Workspace.into(plan, &ws_storage);
 
-    var ws: Workspace = .{};
     var dx: [2]f64 = undefined;
-    const inside = plan.rhs(&.{ 5.0, 0.0 }, &.{ 0.0, 0.05, 19.6 }, &ws, &dx);
+    const inside = plan.rhs(&.{ 5.0, 0.0 }, &.{ 0.0, 0.05, 19.6 }, ws, &dx);
     try std.testing.expectEqual(base.Validity.valid, inside);
-    const outside = plan.rhs(&.{ 5.0, 0.0 }, &.{ 0.0, 0.4, 19.6 }, &ws, &dx);
+    const outside = plan.rhs(&.{ 5.0, 0.0 }, &.{ 0.0, 0.4, 19.6 }, ws, &dx);
     try std.testing.expectEqual(base.Validity.beyond_envelope, outside);
     const surface = plan.nodeIndex("surface").?;
     try std.testing.expectEqual(base.Validity.beyond_envelope, ws.validity[surface]);
@@ -200,15 +210,17 @@ test "leaving the measured range is reported through the whole architecture" {
 }
 
 test "evaluation is total: garbage in gives finite signals and an invalid flag" {
-    var plan: Plan = undefined;
+    var plan_storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
     const comps = falling_body.components(falling_body.drag_surface());
     const spec = falling_body.spec(&comps);
-    try compileOrFail(&spec, &plan);
+    const plan = try compileOrFail(&spec, &plan_storage, &diag);
+    const ws = Workspace.into(plan, &ws_storage);
 
     const nan = std.math.nan(f64);
     const inf = std.math.inf(f64);
     const bad_values = [_]f64{ nan, inf, -inf, 1e308 };
-    var ws: Workspace = .{};
     var dx: [2]f64 = undefined;
 
     for (bad_values) |bad| {
@@ -221,7 +233,7 @@ test "evaluation is total: garbage in gives finite signals and an invalid flag" 
         };
         for (states) |x| {
             for (exts) |e| {
-                const v = plan.rhs(&x, &e, &ws, &dx);
+                const v = plan.rhs(&x, &e, ws, &dx);
                 // Component outputs and derivatives are always finite.
                 for (ws.signals[plan.n_externals..plan.n_signals]) |s| {
                     try std.testing.expect(std.math.isFinite(s));
@@ -235,13 +247,15 @@ test "evaluation is total: garbage in gives finite signals and an invalid flag" 
         }
     }
     // A poisoned state is flagged, not hidden.
-    const poisoned = plan.rhs(&.{ nan, 0.0 }, &.{ 0.0, 0.0, 19.6 }, &ws, &dx);
+    const poisoned = plan.rhs(&.{ nan, 0.0 }, &.{ 0.0, 0.0, 19.6 }, ws, &dx);
     try std.testing.expectEqual(base.Validity.invalid, poisoned);
 }
 
 test "random architectures of gains evaluate to the product of their gains" {
     // A property test of the plan machinery: a random chain, declared in random order,
     // must evaluate to x * k1 * k2 * ... regardless of declaration order.
+    var plan_storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var rng = base.Rng.init(2468);
     for (0..200) |_| {
         const n = 1 + rng.below(20);
@@ -286,10 +300,10 @@ test "random architectures of gains evaluate to the product of their gains" {
             .externals = &.{.{ .name = "x", .dim = base.dim.dimensionless }},
             .connections = conns[0..n_conn],
         };
-        var plan: Plan = undefined;
-        try compileOrFail(&spec, &plan);
-        var ws: Workspace = .{};
-        _ = plan.evaluate(&.{}, &.{3.0}, &ws);
+        var diag: Diagnostic = .{};
+        const plan = try compileOrFail(&spec, &plan_storage, &diag);
+        const ws = Workspace.into(plan, &ws_storage);
+        _ = plan.evaluate(&.{}, &.{3.0}, ws);
         var tail_buf: [12]u8 = undefined;
         const tail = std.fmt.bufPrint(&tail_buf, "g{d}.y", .{order[n - 1]}) catch unreachable;
         try std.testing.expectApproxEqRel(expected, ws.signals[plan.signalIndex(tail).?], 1e-12);

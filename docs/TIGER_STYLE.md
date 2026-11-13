@@ -21,9 +21,11 @@ judgment does not belong in it.
 
 ## Practiced, reviewed by people
 
-**Static allocation.** Capacities live in `src/core/base/limits.zig`. Data that comes from the
-outside world and can exceed a limit returns a precise error (`error.Full`,
-`TooManyComponents`); a limit the caller guarantees is an assertion.
+**Exact storage, carved by the caller.** Plan and workspace sizes are computed from the spec
+(`model.bytesNeeded`, `Workspace.bytesNeeded`) and carved from a byte buffer the caller owns.
+Encoding widths and solver policies live in `src/core/base/limits.zig`; there are no global
+capacities. Data that cannot fit its buffer returns a precise error (`error.BufferTooSmall`,
+`TooManyComponents`); a size the caller guarantees is an assertion.
 
 **Assertions.** Assert preconditions, postconditions and invariants, at least two per
 non-trivial function, and across the boundary of every function that takes external data.

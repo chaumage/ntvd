@@ -18,10 +18,10 @@ pub const Model = union(enum) {
     pub const State = struct {};
 
     pub const signature = contract.signature(Model, .{
-        .in_dims = .{ .altitude = base.dim.length },
-        .out_dims = .{
-            .density = base.dim.density,
-            .speed_of_sound = base.dim.speed,
+        .in = .{ .altitude = contract.scalar(base.dim.length) },
+        .out = .{
+            .density = contract.scalar(base.dim.density),
+            .speed_of_sound = contract.scalar(base.dim.speed),
         },
         .feedthrough = true,
     });

@@ -18,8 +18,8 @@ pub const Model = union(enum) {
     pub const State = struct {};
 
     pub const signature = contract.signature(Model, .{
-        .in_dims = .{ .x = base.dim.dimensionless },
-        .out_dims = .{ .y = base.dim.dimensionless },
+        .in = .{ .x = contract.scalar(base.dim.dimensionless) },
+        .out = .{ .y = contract.scalar(base.dim.dimensionless) },
         .feedthrough = true,
     });
 

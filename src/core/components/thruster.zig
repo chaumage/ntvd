@@ -29,11 +29,11 @@ pub const Model = union(enum) {
     pub const State = struct {};
 
     pub const signature = contract.signature(Model, .{
-        .in_dims = .{
-            .airspeed = base.dim.speed,
-            .throttle = base.dim.dimensionless,
+        .in = .{
+            .airspeed = contract.scalar(base.dim.speed),
+            .throttle = contract.scalar(base.dim.dimensionless),
         },
-        .out_dims = .{ .thrust = base.dim.force },
+        .out = .{ .thrust = contract.scalar(base.dim.force) },
         .feedthrough = true,
     });
 

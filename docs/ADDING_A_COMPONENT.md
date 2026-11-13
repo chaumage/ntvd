@@ -48,8 +48,11 @@ Example: `hull_resistance` (speed, density -> drag).
        pub const State = struct {};          // empty for a static kind
 
        pub const signature = contract.signature(Model, .{
-           .in_dims = .{ .speed = base.dim.speed, .density = base.dim.density },
-           .out_dims = .{ .drag = base.dim.force },
+           .in = .{
+               .speed = contract.scalar(base.dim.speed),
+               .density = contract.scalar(base.dim.density),
+           },
+           .out = .{ .drag = contract.scalar(base.dim.force) },
            .feedthrough = true,              // must be true when there are no states
        });
        pub fn validate(...) ...
@@ -57,9 +60,12 @@ Example: `hull_resistance` (speed, density -> drag).
        // pub fn derivatives(...)  only if State has fields
    };
    ```
-   Every field of `In`, `Out` and `State` must be `f64` and must appear in the dimension
-   lists; the compiler tells you precisely what is missing. Mark inputs that add up (forces)
-   with `.in_sum = .{ .force = true }`.
+   Every field of `In`, `Out` and `State` must be `f64`, `Vec3`, `Quat` or `Wrench` and
+   must appear in the matching table; the compiler tells you precisely what is missing.
+   Use `contract.vec3(dim, quantity, frame)`, `contract.quat(frame)` and
+   `contract.wrench(frame)` for wide ports: the shape is derived from the field type and
+   checked against the declared one. Mark inputs that add up (forces) with
+   `.in_sum = .{ .force = true }`.
 2. Register it in `src/core/components/registry.zig` (one import, one union field) and in
    `src/core/components/root.zig`. The compiler then points at every place that must learn about
    it, and `assertKind` checks the contract at compile time.

@@ -1,8 +1,8 @@
 //! Architecture fuzzer: random valid and invalid specs against the model compiler.
 //!
 //! Contract under test, for every generated spec:
-//!   * `compile` terminates and returns either a plan or an error with a diagnostic;
-//!     it never crashes, hangs, or asserts on bad input.
+//!   * `bytesNeeded` yields a size, and `compileInto` given that much storage either returns
+//!     a plan or an error with a diagnostic; it never crashes, hangs, or asserts on bad input.
 //!   * A returned plan is internally consistent: the order is a permutation, every
 //!     feedthrough node comes after the producers of its inputs.
 //!   * Evaluating a returned plan is total: finite component outputs and derivatives for
@@ -94,7 +94,7 @@ fn pickSource(g: *Generated, rng: *Rng, dim: Dim, out: *[24]u8) ?[]const u8 {
     }
     for (g.components[0..g.n_comps]) |c| {
         for (c.component.signature().outputs) |port| {
-            if (!port.dim.eql(dim)) continue;
+            if (!port.ptype.dim.eql(dim)) continue;
             const text = std.fmt.bufPrint(&scratch[n], "{s}.{s}", .{
                 c.name, port.name,
             }) catch unreachable;
@@ -150,7 +150,10 @@ fn generate(g: *Generated, rng: *Rng) void {
                     c.name, port.name,
                 }) catch unreachable;
                 // Occasionally wire a source of a different (but existing) dimension.
-                const dim = if (rng.below(15) == 0) ext_dims[rng.below(max_ext)] else port.dim;
+                const dim = if (rng.below(15) == 0)
+                    ext_dims[rng.below(max_ext)]
+                else
+                    port.ptype.dim;
                 const from = pickSource(g, rng, dim, &buf) orelse continue;
                 const gain: f64 = if (rng.below(2) == 0) 1.0 else -1.0;
                 addConnection(g, from, to, gain);
@@ -161,11 +164,12 @@ fn generate(g: *Generated, rng: *Rng) void {
 }
 
 fn checkPlan(plan: *const model.Plan, rng: *Rng) !void {
+    const allocator = std.testing.allocator;
     const n = plan.n_nodes;
 
     // The order is a permutation.
-    var position: [limits.max_components]u32 = undefined;
-    var seen: [limits.max_components]bool = @splat(false);
+    var position: [max_comps]u32 = undefined;
+    var seen: [max_comps]bool = @splat(false);
     for (plan.order[0..n], 0..) |ni, pos| {
         try std.testing.expect(ni < n and !seen[ni]);
         seen[ni] = true;
@@ -174,8 +178,15 @@ fn checkPlan(plan: *const model.Plan, rng: *Rng) !void {
 
     // Every feedthrough node comes after the producers of its inputs.
     for (plan.nodes[0..n], 0..) |*node, ni| {
-        if (!node.component.signature().feedthrough) continue;
-        for (node.inputs[0..node.n_in]) |wiring| {
+        const sig = node.component.signature();
+        try std.testing.expectEqual(sig.inputSlots(), @as(u16, node.n_in));
+        try std.testing.expectEqual(sig.outputSlots(), @as(u16, node.n_out));
+        try std.testing.expectEqual(sig.stateSlots(), @as(u16, node.n_state));
+        for (sig.inputs, 0..) |port, pi| {
+            try std.testing.expectEqual(port.ptype.width(), node.inputs[pi].width);
+        }
+        if (!sig.feedthrough) continue;
+        for (node.inputs[0..sig.inputs.len]) |wiring| {
             for (plan.links[wiring.first..][0..wiring.count]) |link| {
                 if (link.source < plan.n_externals) continue;
                 const producer = producerOf(plan, link.source);
@@ -184,25 +195,37 @@ fn checkPlan(plan: *const model.Plan, rng: *Rng) !void {
         }
     }
 
-    // Evaluation is total.
-    var ws: model.Workspace = .{};
-    var x: [limits.max_states]f64 = undefined;
-    var dx: [limits.max_states]f64 = undefined;
-    var ext: [limits.max_externals]f64 = undefined;
+    // Evaluation is total. Exact storage: the same contract an embedder gets.
+    const ws_bytes = model.Workspace.bytesNeeded(plan);
+    const ws_storage = try allocator.alignedAlloc(
+        u8,
+        .fromByteUnits(model.storage_alignment),
+        ws_bytes,
+    );
+    defer allocator.free(ws_storage);
+    const ws = model.Workspace.into(plan, ws_storage);
+
+    const x = try allocator.alloc(f64, plan.n_states);
+    defer allocator.free(x);
+    const dx = try allocator.alloc(f64, plan.n_states);
+    defer allocator.free(dx);
+    const ext = try allocator.alloc(f64, plan.n_externals);
+    defer allocator.free(ext);
+
     const inf = std.math.inf(f64);
     const specials = [_]f64{ std.math.nan(f64), inf, -inf, 1.0e308, 0.0 };
     for (0..4) |round| {
-        for (x[0..plan.n_states]) |*v| {
+        for (x) |*v| {
             v.* = if (round == 0) rng.range(-50.0, 50.0) else pick(&specials, rng, round);
         }
-        for (ext[0..plan.n_externals]) |*v| {
+        for (ext) |*v| {
             v.* = if (round < 2) rng.range(-50.0, 50.0) else pick(&specials, rng, round);
         }
-        _ = plan.rhs(x[0..plan.n_states], ext[0..plan.n_externals], &ws, dx[0..plan.n_states]);
+        _ = plan.rhs(x, ext, ws, dx);
         for (ws.signals[plan.n_externals..plan.n_signals]) |v| {
             try std.testing.expect(std.math.isFinite(v));
         }
-        for (dx[0..plan.n_states]) |v| try std.testing.expect(std.math.isFinite(v));
+        for (dx) |v| try std.testing.expect(std.math.isFinite(v));
     }
 }
 
@@ -215,7 +238,7 @@ fn pick(values: []const f64, rng: *Rng, round: usize) f64 {
 fn producerOf(plan: *const model.Plan, signal: u16) u32 {
     const offset = signal - plan.n_externals;
     for (plan.nodes[0..plan.n_nodes], 0..) |*node, ni| {
-        const end = node.out_offset + node.n_out;
+        const end = node.out_offset + @as(u16, node.n_out);
         if (offset >= node.out_offset and offset < end) return @intCast(ni);
     }
     unreachable;
@@ -250,10 +273,9 @@ const ErrorCounts = struct {
 };
 
 test "random architectures: compile is total and plans are sound" {
+    const allocator = std.testing.allocator;
     var rng = Rng.init(options.seed);
     var gen: Generated = undefined;
-    var plan_a: model.Plan = undefined;
-    var plan_b: model.Plan = undefined;
 
     var compiled: u32 = 0;
     var seen_errors: ErrorCounts = .{};
@@ -263,13 +285,26 @@ test "random architectures: compile is total and plans are sound" {
         const spec = gen.spec();
 
         var diag: model.Diagnostic = .{};
-        if (model.compile(&spec, &plan_a, &diag)) {
+        const storage_a = try allocator.alignedAlloc(
+            u8,
+            .fromByteUnits(model.storage_alignment),
+            model.bytesNeeded(&spec),
+        );
+        defer allocator.free(storage_a);
+
+        if (model.compileInto(storage_a, &spec, &diag)) |plan_a| {
             compiled += 1;
-            try checkPlan(&plan_a, &rng);
+            try checkPlan(plan_a, &rng);
 
             // Determinism: the same spec compiles to the same order and layout.
             var diag_b: model.Diagnostic = .{};
-            try model.compile(&spec, &plan_b, &diag_b);
+            const storage_b = try allocator.alignedAlloc(
+                u8,
+                .fromByteUnits(model.storage_alignment),
+                model.bytesNeeded(&spec),
+            );
+            defer allocator.free(storage_b);
+            const plan_b = try model.compileInto(storage_b, &spec, &diag_b);
             try std.testing.expectEqual(plan_a.n_nodes, plan_b.n_nodes);
             const order_a = plan_a.order[0..plan_a.n_nodes];
             const order_b = plan_b.order[0..plan_b.n_nodes];

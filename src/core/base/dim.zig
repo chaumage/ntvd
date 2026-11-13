@@ -83,12 +83,16 @@ pub const volume: Dim = length.pow(3);
 pub const speed: Dim = length.div(time);
 pub const acceleration: Dim = speed.div(time);
 pub const force: Dim = mass.mul(acceleration);
+pub const moment: Dim = force.mul(length);
+pub const inertia: Dim = mass.mul(area);
+pub const mass_flow: Dim = mass.div(time);
 pub const pressure: Dim = force.div(area);
 pub const energy: Dim = force.mul(length);
 pub const power: Dim = energy.div(time);
 pub const density: Dim = mass.div(volume);
 pub const dynamic_viscosity: Dim = pressure.mul(time);
 pub const angular_rate: Dim = angle.div(time);
+pub const angular_momentum: Dim = inertia.mul(angular_rate);
 pub const voltage: Dim = power.div(current);
 
 test "derived dimensions are consistent" {
@@ -98,6 +102,10 @@ test "derived dimensions are consistent" {
     try std.testing.expect(energy.eql(.{ .kg = 1, .m = 2, .s = -2 }));
     try std.testing.expect(pressure.eql(.{ .kg = 1, .m = -1, .s = -2 }));
     try std.testing.expect(density.eql(.{ .kg = 1, .m = -3 }));
+    try std.testing.expect(moment.eql(.{ .kg = 1, .m = 2, .s = -2 }));
+    try std.testing.expect(inertia.eql(.{ .kg = 1, .m = 2 }));
+    try std.testing.expect(mass_flow.eql(.{ .kg = 1, .s = -1 }));
+    try std.testing.expect(angular_momentum.eql(.{ .kg = 1, .m = 2, .s = -1, .rad = 1 }));
     try std.testing.expect(voltage.eql(.{ .kg = 1, .m = 2, .s = -3, .a = -1 }));
 }
 

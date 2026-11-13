@@ -25,12 +25,17 @@ src/core/               the solver (built today)
   L3  solve        time integration; (planned) Newton, trim, algebraic loops
   L2  model        Spec -> compile -> Plan (+ Workspace)
   L1  components   contract + kinds (air, gain, lift_surface, point_mass, thruster)
-  L0  base         dim, units, validity, tables, linalg, rng, atmosphere, limits
+  L0  base         dim, units, geometry, validity, tables, linalg, rng, atmosphere, limits
 ```
 
 Dependencies point down only. `build.zig` creates one Zig module per layer and passes each
 only the lower layers it may use, so a violation does not compile. `test/tidy.zig` repeats the
 rule as a check on import statements, and forbids relative imports across layers.
+
+Frame, sign, orientation and placement conventions are in [`CONVENTIONS.md`](CONVENTIONS.md).
+They are normative: a component author picks up its local axes from there. Its geometric sign
+rows are pinned by tests in `src/core/base/geometry.zig`; the document says where the rest are
+pinned as the corresponding phases land.
 
 Planned above L3, each with its own directory under `src/`: `analysis/` (trim, sweeps,
 missions), `optimize/`, `io/`, `cli/`, `gui/`, and eventually a C ABI. They are empty except
@@ -72,7 +77,27 @@ increasing axes). Outside the measured range a lookup clamps and flags the resul
 ### D3. The contract: signature, feedthrough, states
 
 Each kind declares in a `signature`: inputs, outputs and continuous states, each with a
-physical dimension, and whether outputs depend algebraically on inputs (`feedthrough`).
+**port type**, and whether outputs depend algebraically on inputs (`feedthrough`).
+
+A port type is a `Shape` (how many flat slots it occupies), a physical `Dim`, a `Quantity`
+(what it physically carries) and a `Frame` (which frame a vector is expressed in):
+
+| shape    | slots | field type | example quantity        | dimension           |
+|----------|-------|------------|-------------------------|---------------------|
+| `scalar` | 1     | `f64`      | `.scalar`               | any (e.g. speed)    |
+| `vec3`   | 3     | `Vec3`     | `.velocity`, `.force`   | implied by quantity |
+| `quat`   | 4     | `Quat`     | `.quaternion`           | none                |
+| `wrench` | 6     | `Wrench`   | `.wrench`               | force + moment      |
+
+The shape is derived from the field type; the other properties are authored with helpers:
+`scalar(dim.speed)`, `vec3(dim.force, .force, .body)`, `quat(.body)`, `wrench(.local)`.
+A scalar has no frame; every wide port must name one. A physical vector quantity fixes its
+dimension, so a `velocity` port cannot be declared in metres. The compiler rejects a
+connection whose ports disagree on shape, quantity, frame or dimension.
+
+Wide ports occupy consecutive slots in the flat signal and state arrays. One port has one
+wiring entry, carrying `width` slots; a summing input adds every source slot by slot. The
+plan stores slot offsets and widths, so evaluation stays a flat loop.
 
 - A **static** kind has no states; its outputs depend on its inputs (`feedthrough = true`).
 - A **dynamic** kind has states with `dx/dt = f(x, u)`. If its outputs depend on the states
@@ -91,10 +116,10 @@ forces so that every contribution is wired explicitly with its sign).
 
 - **Spec**: plain data, unvalidated; what a person, a file or an editor produces.
 - **compile**: checks counts against limits, names, parameters, initial states, that every
-  path resolves, that connected ports have **equal physical dimensions**, that every `single`
-  input has exactly one source, and orders components so feedthrough ones follow their
-  sources. Every failure is an error code (stable, testable) plus a human-readable
-  diagnostic ("`speed [m*s^-1] cannot drive body.force [m*kg*s^-2]`").
+  path resolves, that connected ports agree on **shape, quantity, frame and dimension**, that
+  every `single` input has exactly one source, and orders components so feedthrough ones
+  follow their sources. Every failure is an error code (stable, testable) plus a
+  human-readable diagnostic ("`speed [m*s^-1] cannot drive body.force [m*kg*s^-2]`").
 - **Plan**: immutable and fully resolved; evaluation is flat loops over indices with no
   lookups and no error paths.
 
@@ -130,12 +155,25 @@ unit mistakes appear.
 All values are SI inside the core. Conversion from knots, feet and the like happens at the
 boundary (`base.units`).
 
-### D7. Static memory
+### D7. Caller-provided exact storage
 
-`src/core/base/limits.zig` fixes the capacity of everything (components, ports, links, table
-points, unknowns). Nothing in `src/core/` allocates; `tidy` bans allocators and growable
-containers there. A model that does not fit is rejected up front with a precise error. Sizes
-today: a `Plan` is 82 KB, a `Workspace` 4.4 KB; create a plan once and pass it by pointer.
+`src/core/base/limits.zig` keeps only the widths of the encoding (indices are `u16`; a port has
+at most `max_ports` slots) and solver policies. There are no global capacities: the size of a
+plan and a workspace are computed from the spec.
+
+Nothing in `src/core/` allocates. A plan and a workspace are carved out of a byte buffer the
+caller owns, aligned to `model.storage_alignment`:
+
+```zig
+const needed = model.bytesNeeded(&spec);           // exact for this spec
+const plan = try model.compileInto(buffer, &spec, &diag);
+const ws = model.Workspace.into(plan, ws_buffer);
+```
+
+`Plan` and `Workspace` are headers of slices into that buffer, so passing a plan by pointer is
+cheap and evaluation touches only caller-owned memory. Undersized storage is refused up front
+with `error.BufferTooSmall` and a diagnostic stating the size difference. Reusing memory means
+recompiling into the same buffer, outside the solver.
 
 ### D8. Determinism
 
@@ -181,7 +219,8 @@ The fuzzer has run 800 000 random architectures across several seeds in ReleaseS
 
 Done: base layer; component contract with dynamics and fidelity variants; five kinds
 (air, gain, lift_surface, point_mass, thruster); spec/compile/plan; RK4 integration; fuzzer;
-style checker.
+style checker; frame/placement conventions and geometry primitives (`Vec3`, `Quat`, `Rotation`)
+for the 3D work.
 
 Next, roughly in order:
 
@@ -204,7 +243,8 @@ Next, roughly in order:
 ## 7. Known limitations
 
 - `point_mass` is one-dimensional. Real vehicle dynamics need frames, rotation and
-  attitude; that is new kinds on the existing contract, not a new core.
+  attitude. The conventions and geometry primitives are in place; the 3D body and local-frame
+  kinds are new kinds on the existing contract, not a new core.
 - The set of kinds is closed (a tagged union): adding one means editing `registry.zig`.
   Third-party kinds would need a separate C-ABI variant.
 - Time integration is fixed-step explicit RK4 with externals held constant over a step. Stiff

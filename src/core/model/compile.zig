@@ -1,13 +1,15 @@
 //! Spec -> Plan. Rejects every structural mistake with a precise error and a diagnostic.
 //!
 //! Stages (each a small function, run in this order):
-//!   1. counts        the architecture fits the static limits
-//!   2. externals     names and dimensions of the boundary signals
-//!   3. nodes         names, parameter checks, initial states, signal and state layout
-//!   4. connections   paths resolve, dimensions agree, gains are finite
-//!   5. drivers       every `single` input has exactly one source
-//!   6. links         connections laid out per input port
-//!   7. order         feedthrough components sorted after their sources
+//!   1. measure       exact layout and byte count of the plan
+//!   2. build         externals, nodes, initial states, signal and state layout
+//!   3. connections   paths resolve, dimensions agree, gains are finite
+//!   4. drivers       every `single` input has exactly one source
+//!   5. links         connections laid out per input port
+//!   6. order         feedthrough components sorted after their sources
+//!
+//! The plan is carved from a caller-owned buffer. `bytesNeeded` and `compileInto` share
+//! `measure`, so the required size and the actual layout cannot drift.
 //!
 //! Algebraic loops (feedthrough components feeding each other in a cycle) are rejected for
 //! now. The way to break one is to make a state of it (a dynamic component) or to turn the
@@ -16,8 +18,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const base = @import("base");
+const components_contract = @import("components").contract;
 const spec_mod = @import("spec.zig");
 const plan_mod = @import("plan.zig");
+const storage_mod = @import("storage.zig");
 const path = @import("path.zig");
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
 
@@ -25,11 +29,19 @@ const limits = base.limits;
 const Spec = spec_mod.Spec;
 const Plan = plan_mod.Plan;
 const Node = plan_mod.Node;
+const Link = plan_mod.Link;
+const Name = base.Name;
+const Dim = base.Dim;
+const Sizer = storage_mod.Sizer;
+const Carver = storage_mod.Carver;
 
 pub const CompileError = error{
+    BufferTooSmall,
     TooManyComponents,
     TooManyExternals,
     TooManyConnections,
+    TooManyStates,
+    TooManySignals,
     InvalidName,
     DuplicateName,
     InvalidParameter,
@@ -38,6 +50,7 @@ pub const CompileError = error{
     UnknownComponent,
     UnknownExternal,
     UnknownPort,
+    FrameMismatch,
     DimensionMismatch,
     InvalidGain,
     MultiplyDriven,
@@ -55,38 +68,161 @@ const Resolved = struct {
     gain: f64,
 };
 
-/// Compiles `spec` into `plan`. On error `plan` is unusable and `diag` explains why.
-pub fn compile(spec: *const Spec, plan: *Plan, diag: *Diagnostic) CompileError!void {
-    diag.* = .{};
-    try checkCounts(spec, diag);
-    try buildExternals(spec, plan, diag);
-    try buildNodes(spec, plan, diag);
-
-    var resolved: [limits.max_links]Resolved = undefined;
-    const n = try resolveConnections(spec, plan, &resolved, diag);
-    try checkDrivers(plan, resolved[0..n], diag);
-    layoutLinks(plan, resolved[0..n]);
-    try orderNodes(plan, resolved[0..n], diag);
+comptime {
+    if (@alignOf(Resolved) > storage_mod.alignment) {
+        @compileError("Resolved alignment exceeds storage");
+    }
+    if (@alignOf(Name) > storage_mod.alignment) {
+        @compileError("Name alignment exceeds storage");
+    }
+    if (@alignOf(Dim) > storage_mod.alignment) {
+        @compileError("Dim alignment exceeds storage");
+    }
 }
 
-fn checkCounts(spec: *const Spec, diag: *Diagnostic) CompileError!void {
-    if (spec.components.len > limits.max_components) {
-        diag.set("{d} components exceed the limit of {d}", .{
-            spec.components.len, limits.max_components,
-        });
-        return error.TooManyComponents;
+/// Counts and byte size of one plan. `usize` so the size can be computed before any ceiling
+/// check; `compileInto` rejects anything that does not fit the `u16` encoding.
+pub const Layout = struct {
+    n_externals: usize,
+    n_nodes: usize,
+    n_links: usize,
+    n_states: usize,
+    n_signals: usize,
+    n_attitude_states: usize,
+    n_connections: usize,
+    bytes: usize,
+};
+
+/// Exact byte count for `spec` if it compiles; a safe upper bound otherwise.
+pub fn bytesNeeded(spec: *const Spec) usize {
+    return measure(spec).bytes;
+}
+
+/// Builds a plan in `storage` and returns a pointer to the header at its start. The storage
+/// must outlive the plan and must not be reused while the plan is alive.
+pub fn compileInto(
+    storage: storage_mod.Buffer,
+    spec: *const Spec,
+    diag: *Diagnostic,
+) CompileError!*Plan {
+    diag.* = .{};
+    const layout = measure(spec);
+    if (storage.len < layout.bytes) {
+        diag.set("plan storage needs {d} bytes, got {d}", .{ layout.bytes, storage.len });
+        return error.BufferTooSmall;
     }
-    if (spec.externals.len > limits.max_externals) {
-        diag.set("{d} externals exceed the limit of {d}", .{
-            spec.externals.len, limits.max_externals,
+    try checkCounts(layout, diag);
+
+    var carver = Carver.init(storage);
+    const plan = carver.takeOne(Plan);
+    const external_names = carver.take(Name, layout.n_externals);
+    const external_dims = carver.take(Dim, layout.n_externals);
+    const nodes = carver.take(Node, layout.n_nodes);
+    const order = carver.take(u16, layout.n_nodes);
+    const links = carver.take(Link, layout.n_links);
+    const initial_state = carver.take(f64, layout.n_states);
+    const attitude_states = carver.take(u16, layout.n_attitude_states);
+    const resolved = carver.take(Resolved, layout.n_connections);
+    const waiting = carver.take(u16, layout.n_nodes);
+    const placed = carver.take(bool, layout.n_nodes);
+    assert(carver.cursor == layout.bytes);
+
+    plan.* = .{
+        .external_names = external_names,
+        .external_dims = external_dims,
+        .nodes = nodes,
+        .order = order,
+        .links = links,
+        .initial_state = initial_state,
+        .attitude_states = attitude_states,
+        .n_externals = @intCast(layout.n_externals),
+        .n_nodes = @intCast(layout.n_nodes),
+        .n_links = @intCast(layout.n_links),
+        .n_states = @intCast(layout.n_states),
+        .n_signals = @intCast(layout.n_signals),
+    };
+
+    try buildExternals(spec, plan, diag);
+    try buildNodes(spec, plan, initial_state, diag);
+    const n = try resolveConnections(spec, plan, resolved, diag);
+    try checkDrivers(plan, resolved[0..n], diag);
+    layoutLinks(plan, resolved[0..n]);
+    try orderNodes(plan, resolved[0..n], waiting, placed, diag);
+    return plan;
+}
+
+/// Counts and byte size only. Never fails: an invalid spec still has a computable footprint.
+fn measure(spec: *const Spec) Layout {
+    var n_states: usize = 0;
+    var n_outputs: usize = 0;
+    for (spec.components) |cs| {
+        const sig = cs.component.signature();
+        n_states += @as(usize, sig.stateSlots());
+        n_outputs += @as(usize, sig.outputSlots());
+        // Phase 2b derives attitude slots from `quantity = .quaternion`; none yet.
+    }
+    const n_externals = spec.externals.len;
+    const n_nodes = spec.components.len;
+    const n_links = spec.connections.len;
+    const n_signals = n_externals + n_outputs;
+    const n_connections = spec.connections.len;
+
+    var sizer: Sizer = .{};
+    sizer.add(Plan, 1);
+    sizer.add(Name, n_externals);
+    sizer.add(Dim, n_externals);
+    sizer.add(Node, n_nodes);
+    sizer.add(u16, n_nodes);
+    sizer.add(Link, n_links);
+    sizer.add(f64, n_states);
+    sizer.add(u16, 0);
+    sizer.add(Resolved, n_connections);
+    sizer.add(u16, n_nodes);
+    sizer.add(bool, n_nodes);
+
+    return .{
+        .n_externals = n_externals,
+        .n_nodes = n_nodes,
+        .n_links = n_links,
+        .n_states = n_states,
+        .n_signals = n_signals,
+        .n_attitude_states = 0,
+        .n_connections = n_connections,
+        .bytes = sizer.bytes(),
+    };
+}
+
+fn checkCounts(layout: Layout, diag: *Diagnostic) CompileError!void {
+    const ceiling: usize = limits.max_index;
+    if (layout.n_externals > ceiling) {
+        diag.set("{d} externals exceed the u16 encoding limit of {d}", .{
+            layout.n_externals, ceiling,
         });
         return error.TooManyExternals;
     }
-    if (spec.connections.len > limits.max_links) {
-        diag.set("{d} connections exceed the limit of {d}", .{
-            spec.connections.len, limits.max_links,
+    if (layout.n_nodes > ceiling) {
+        diag.set("{d} components exceed the u16 encoding limit of {d}", .{
+            layout.n_nodes, ceiling,
+        });
+        return error.TooManyComponents;
+    }
+    if (layout.n_links > ceiling or layout.n_connections > ceiling) {
+        diag.set("{d} connections exceed the u16 encoding limit of {d}", .{
+            layout.n_connections, ceiling,
         });
         return error.TooManyConnections;
+    }
+    if (layout.n_states > ceiling) {
+        diag.set("{d} states exceed the u16 encoding limit of {d}", .{
+            layout.n_states, ceiling,
+        });
+        return error.TooManyStates;
+    }
+    if (layout.n_signals > ceiling) {
+        diag.set("{d} signals exceed the u16 encoding limit of {d}", .{
+            layout.n_signals, ceiling,
+        });
+        return error.TooManySignals;
     }
 }
 
@@ -98,7 +234,6 @@ fn makeName(text: []const u8, what: []const u8, diag: *Diagnostic) CompileError!
 }
 
 fn buildExternals(spec: *const Spec, plan: *Plan, diag: *Diagnostic) CompileError!void {
-    plan.n_externals = @intCast(spec.externals.len);
     for (spec.externals, 0..) |ext, i| {
         plan.external_names[i] = try makeName(ext.name, "external", diag);
         plan.external_dims[i] = ext.dim;
@@ -111,8 +246,12 @@ fn buildExternals(spec: *const Spec, plan: *Plan, diag: *Diagnostic) CompileErro
     }
 }
 
-fn buildNodes(spec: *const Spec, plan: *Plan, diag: *Diagnostic) CompileError!void {
-    plan.n_nodes = @intCast(spec.components.len);
+fn buildNodes(
+    spec: *const Spec,
+    plan: *Plan,
+    initial_state: []f64,
+    diag: *Diagnostic,
+) CompileError!void {
     var state_cursor: u16 = 0;
     var out_cursor: u16 = 0;
     for (spec.components, 0..) |cs, i| {
@@ -132,32 +271,34 @@ fn buildNodes(spec: *const Spec, plan: *Plan, diag: *Diagnostic) CompileError!vo
 
         const sig = cs.component.signature();
         const node = &plan.nodes[i];
+        const in_slots = sig.inputSlots();
+        const out_slots = sig.outputSlots();
+        const state_slots = sig.stateSlots();
         node.name = name;
         node.component = cs.component;
-        node.n_in = @intCast(sig.inputs.len);
-        node.n_out = @intCast(sig.outputs.len);
-        node.n_state = @intCast(sig.states.len);
+        node.n_in = @intCast(in_slots);
+        node.n_out = @intCast(out_slots);
+        node.n_state = @intCast(state_slots);
         node.state_offset = state_cursor;
         node.out_offset = out_cursor;
         node.inputs = @splat(.{});
 
-        try copyInitialState(cs, plan, state_cursor, diag);
-        state_cursor += node.n_state;
-        out_cursor += node.n_out;
+        try copyInitialState(cs, initial_state, state_cursor, diag);
+        state_cursor += state_slots;
+        out_cursor += out_slots;
     }
-    plan.n_states = state_cursor;
-    plan.n_signals = plan.n_externals + out_cursor;
-    assert(plan.n_states <= limits.max_states and plan.n_signals <= limits.max_signals);
+    assert(state_cursor == plan.n_states);
+    assert(plan.n_externals + out_cursor == plan.n_signals);
 }
 
 fn copyInitialState(
     cs: spec_mod.ComponentSpec,
-    plan: *Plan,
+    state: []f64,
     offset: u16,
     diag: *Diagnostic,
 ) CompileError!void {
-    const n = cs.component.signature().states.len;
-    const dest = plan.initial_state[offset..][0..n];
+    const n: usize = cs.component.signature().stateSlots();
+    const dest = state[offset..][0..n];
     if (cs.initial_state.len == 0) {
         @memset(dest, 0.0);
         return;
@@ -180,16 +321,21 @@ fn copyInitialState(
 fn resolveConnections(
     spec: *const Spec,
     plan: *const Plan,
-    out: *[limits.max_links]Resolved,
+    out: []Resolved,
     diag: *Diagnostic,
 ) CompileError!u32 {
+    assert(out.len == spec.connections.len);
     for (spec.connections, 0..) |c, i| {
         out[i] = try resolveOne(c, plan, diag);
     }
     return @intCast(spec.connections.len);
 }
 
-const Endpoint = struct { signal_or_port: u16, node: ?u16, dim: base.Dim };
+const Endpoint = struct {
+    signal_or_port: u16,
+    node: ?u16,
+    ptype: components_contract.PortType,
+};
 
 fn resolveOne(
     c: spec_mod.ConnectionSpec,
@@ -202,9 +348,17 @@ fn resolveOne(
     }
     const from = try resolveSource(c.from, plan, diag);
     const to = try resolveTarget(c.to, plan, diag);
-    if (!from.dim.eql(to.dim)) {
-        diag.set("{s} [{f}] cannot drive {s} [{f}]", .{ c.from, from.dim, c.to, to.dim });
-        return error.DimensionMismatch;
+    if (components_contract.compatibility(from.ptype, to.ptype)) |reason| {
+        if (reason == .dimension) {
+            diag.set("{s} [{f}] cannot drive {s} [{f}]", .{
+                c.from, from.ptype.dim, c.to, to.ptype.dim,
+            });
+            return error.DimensionMismatch;
+        }
+        diag.set("{s} cannot drive {s}: incompatible {s}", .{
+            c.from, c.to, @tagName(reason),
+        });
+        return error.FrameMismatch;
     }
     return .{
         .to_node = to.node.?,
@@ -225,7 +379,11 @@ fn resolveSource(text: []const u8, plan: *const Plan, diag: *Diagnostic) Compile
             diag.set("unknown external signal '{s}'", .{p.head});
             return error.UnknownExternal;
         };
-        return .{ .signal_or_port = ei, .node = null, .dim = plan.external_dims[ei] };
+        return .{
+            .signal_or_port = ei,
+            .node = null,
+            .ptype = components_contract.scalar(plan.external_dims[ei]),
+        };
     };
     const ni = plan.nodeIndex(p.head) orelse {
         diag.set("unknown component '{s}' in '{s}'", .{ p.head, text });
@@ -237,10 +395,11 @@ fn resolveSource(text: []const u8, plan: *const Plan, diag: *Diagnostic) Compile
         diag.set("component '{s}' has no output '{s}'", .{ p.head, port });
         return error.UnknownPort;
     };
+    const slot = components_contract.slotsBefore(sig.outputs, oi);
     return .{
-        .signal_or_port = plan.n_externals + node.out_offset + @as(u16, @intCast(oi)),
+        .signal_or_port = plan.n_externals + node.out_offset + slot,
         .node = ni,
-        .dim = sig.outputs[oi].dim,
+        .ptype = sig.outputs[oi].ptype,
     };
 }
 
@@ -262,22 +421,20 @@ fn resolveTarget(text: []const u8, plan: *const Plan, diag: *Diagnostic) Compile
         diag.set("component '{s}' has no input '{s}'", .{ p.head, port });
         return error.UnknownPort;
     };
-    return .{ .signal_or_port = @intCast(ii), .node = ni, .dim = sig.inputs[ii].dim };
+    return .{ .signal_or_port = @intCast(ii), .node = ni, .ptype = sig.inputs[ii].ptype };
 }
 
-fn checkDrivers(
-    plan: *const Plan,
-    resolved: []const Resolved,
-    diag: *Diagnostic,
-) CompileError!void {
-    var counts: [limits.max_components][limits.max_ports]u16 = @splat(@splat(0));
-    for (resolved) |r| counts[r.to_node][r.to_port] += 1;
+/// Counts the sources of every input port using the (zeroed) wiring table, then rejects a
+/// `single` port with zero or several sources. `layoutLinks` overwrites the table afterwards.
+fn checkDrivers(plan: *Plan, resolved: []const Resolved, diag: *Diagnostic) CompileError!void {
+    for (plan.nodes) |*node| node.inputs = @splat(.{});
+    for (resolved) |r| plan.nodes[r.to_node].inputs[r.to_port].count += 1;
 
-    for (plan.nodes[0..plan.n_nodes], 0..) |*node, ni| {
+    for (plan.nodes) |*node| {
         const sig = node.component.signature();
         for (sig.inputs, 0..) |port, pi| {
-            const count = counts[ni][pi];
-            if (port.fan_in == .sum) continue;
+            const count = node.inputs[pi].count;
+            if (port.ptype.fan_in == .sum) continue;
             if (count == 0) {
                 diag.set("input '{s}.{s}' is not connected", .{ node.name.slice(), port.name });
                 return error.UnconnectedInput;
@@ -294,40 +451,57 @@ fn checkDrivers(
 
 fn layoutLinks(plan: *Plan, resolved: []const Resolved) void {
     var cursor: u16 = 0;
-    for (plan.nodes[0..plan.n_nodes], 0..) |*node, ni| {
-        for (0..node.n_in) |pi| {
+    for (plan.nodes, 0..) |*node, ni| {
+        const sig = node.component.signature();
+        var slot: u16 = 0;
+        for (sig.inputs, 0..) |port, pi| {
             const first = cursor;
             for (resolved) |r| {
                 if (r.to_node != ni or r.to_port != pi) continue;
                 plan.links[cursor] = .{ .source = r.source, .gain = r.gain };
                 cursor += 1;
             }
-            node.inputs[pi] = .{ .first = first, .count = cursor - first };
+            node.inputs[pi] = .{
+                .first = first,
+                .count = cursor - first,
+                .slot = slot,
+                .width = port.ptype.width(),
+            };
+            slot += @as(u16, port.ptype.width());
         }
+        assert(slot == @as(u16, node.n_in));
     }
-    plan.n_links = cursor;
-    assert(cursor == resolved.len);
+    assert(cursor == plan.n_links);
 }
 
 /// Kahn's algorithm. Only links into feedthrough components constrain the order: a component
 /// without feedthrough computes its outputs from its states alone.
-fn orderNodes(plan: *Plan, resolved: []const Resolved, diag: *Diagnostic) CompileError!void {
-    const n = plan.n_nodes;
-    var waiting: Counters = @splat(0);
-    var placed: Flags = @splat(false);
+fn orderNodes(
+    plan: *Plan,
+    resolved: []const Resolved,
+    waiting: []u16,
+    placed: []bool,
+    diag: *Diagnostic,
+) CompileError!void {
+    const n: usize = plan.n_nodes;
+    assert(waiting.len == n and placed.len == n);
+    @memset(waiting, 0);
+    @memset(placed, false);
 
     for (resolved) |r| {
         if (constrains(plan, r)) waiting[r.to_node] += 1;
     }
     for (0..n) |step| {
-        const next = firstReady(n, &waiting, &placed) orelse {
-            reportLoop(plan, &placed, diag);
+        const next = firstReady(n, waiting, placed) orelse {
+            reportLoop(plan, placed, diag);
             return error.AlgebraicLoop;
         };
         placed[next] = true;
-        plan.order[step] = next;
+        plan.order[step] = @intCast(next);
         for (resolved) |r| {
-            if (r.from_node == next and constrains(plan, r)) waiting[r.to_node] -= 1;
+            if (r.from_node == @as(u16, @intCast(next)) and constrains(plan, r)) {
+                waiting[r.to_node] -= 1;
+            }
         }
     }
 }
@@ -336,20 +510,17 @@ fn constrains(plan: *const Plan, r: Resolved) bool {
     return r.from_node != null and plan.nodes[r.to_node].component.signature().feedthrough;
 }
 
-const Counters = [limits.max_components]u16;
-const Flags = [limits.max_components]bool;
-
-fn firstReady(n: u16, waiting: *const Counters, placed: *const Flags) ?u16 {
+fn firstReady(n: usize, waiting: []const u16, placed: []const bool) ?usize {
     for (0..n) |i| {
-        if (!placed[i] and waiting[i] == 0) return @intCast(i);
+        if (!placed[i] and waiting[i] == 0) return i;
     }
     return null;
 }
 
-fn reportLoop(plan: *const Plan, placed: *const Flags, diag: *Diagnostic) void {
+fn reportLoop(plan: *const Plan, placed: []const bool, diag: *Diagnostic) void {
     var buf: [200]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    for (plan.nodes[0..plan.n_nodes], 0..) |*node, i| {
+    for (plan.nodes, 0..) |*node, i| {
         if (placed[i]) continue;
         w.print("{s}{s}", .{ if (w.end == 0) "" else ", ", node.name.slice() }) catch break;
     }
@@ -364,13 +535,25 @@ const ComponentSpec = spec_mod.ComponentSpec;
 const ConnectionSpec = spec_mod.ConnectionSpec;
 const ExternalSpec = spec_mod.ExternalSpec;
 
+const test_plan_bytes = 256 * 1024;
+const test_ws_bytes = 8 * 1024;
+
 const gain2: spec_mod.Component = .{ .gain = .{ .linear = .{ .k = 2.0 } } };
 const mass1: spec_mod.Component = .{ .point_mass = .{ .rigid = .{ .mass_kg = 1.0 } } };
 
+fn compileForTest(
+    spec: *const Spec,
+    storage: []align(plan_mod.storage_alignment) u8,
+    diag: *Diagnostic,
+) !*Plan {
+    try std.testing.expect(bytesNeeded(spec) <= storage.len);
+    return compileInto(storage, spec, diag);
+}
+
 fn expectFails(spec: Spec, expected: CompileError) !void {
-    var plan: Plan = undefined;
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var diag: Diagnostic = .{};
-    try std.testing.expectError(expected, compile(&spec, &plan, &diag));
+    try std.testing.expectError(expected, compileForTest(&spec, &storage, &diag));
     try std.testing.expect(diag.message().len > 0);
 }
 
@@ -389,9 +572,9 @@ test "a chain of gains compiles in dependency order" {
             .{ .from = "b.y", .to = "c.x" },
         },
     };
-    var plan: Plan = undefined;
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var diag: Diagnostic = .{};
-    try compile(&spec, &plan, &diag);
+    const plan = try compileForTest(&spec, &storage, &diag);
     try std.testing.expectEqual(@as(u16, 3), plan.n_nodes);
     const names = [_][]const u8{
         plan.nodes[plan.order[0]].name.slice(),
@@ -402,8 +585,9 @@ test "a chain of gains compiles in dependency order" {
     try std.testing.expectEqualStrings("b", names[1]);
     try std.testing.expectEqualStrings("c", names[2]);
 
-    var ws: plan_mod.Workspace = .{};
-    const v = plan.evaluate(&.{}, &.{3.0}, &ws);
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    const v = plan.evaluate(&.{}, &.{3.0}, ws);
     try std.testing.expectEqual(base.Validity.valid, v);
     try std.testing.expectEqual(@as(f64, 24.0), ws.signals[plan.signalIndex("c.y").?]);
     try std.testing.expectEqual(@as(f64, 6.0), ws.signals[plan.signalIndex("a.y").?]);
@@ -463,9 +647,12 @@ test "connecting mismatched dimensions is rejected and explained" {
         .externals = &.{.{ .name = "speed", .dim = base.dim.speed }},
         .connections = &.{.{ .from = "speed", .to = "body.force" }},
     };
-    var plan: Plan = undefined;
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var diag: Diagnostic = .{};
-    try std.testing.expectError(error.DimensionMismatch, compile(&spec, &plan, &diag));
+    try std.testing.expectError(
+        error.DimensionMismatch,
+        compileForTest(&spec, &storage, &diag),
+    );
     try std.testing.expectEqualStrings(
         "speed [m*s^-1] cannot drive body.force [m*kg*s^-2]",
         diag.message(),
@@ -495,9 +682,9 @@ test "an algebraic loop is detected and named" {
             .{ .from = "b.y", .to = "a.x" },
         },
     };
-    var plan: Plan = undefined;
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var diag: Diagnostic = .{};
-    try std.testing.expectError(error.AlgebraicLoop, compile(&spec, &plan, &diag));
+    try std.testing.expectError(error.AlgebraicLoop, compileForTest(&spec, &storage, &diag));
     try std.testing.expectEqualStrings("algebraic loop among components: a, b", diag.message());
 
     // A component feeding itself is the smallest loop.
@@ -505,19 +692,28 @@ test "an algebraic loop is detected and named" {
         .components = &.{.{ .name = "a", .component = gain2 }},
         .connections = &.{.{ .from = "a.y", .to = "a.x" }},
     };
-    try std.testing.expectError(error.AlgebraicLoop, compile(&selfie, &plan, &diag));
+    try std.testing.expectError(error.AlgebraicLoop, compileForTest(&selfie, &storage, &diag));
 }
 
-test "limits are enforced before anything is built" {
-    var many: [limits.max_components + 1]ComponentSpec = undefined;
-    for (&many, 0..) |*c, i| {
-        _ = i;
-        c.* = .{ .name = "g", .component = gain2 };
+test "the old component cap is gone and an undersized buffer is refused" {
+    // 65 summing nodes: more than the old `max_components`, and each `force` input may be
+    // legally unconnected.
+    var comps: [65]ComponentSpec = undefined;
+    var names: [65][8]u8 = undefined;
+    for (&comps, 0..) |*c, i| {
+        const name = std.fmt.bufPrint(&names[i], "m{d}", .{i}) catch unreachable;
+        c.* = .{ .name = name, .component = mass1 };
     }
-    try expectFails(.{ .components = &many }, error.TooManyComponents);
-    var externals: [limits.max_externals + 1]ExternalSpec = undefined;
-    for (&externals) |*e| e.* = .{ .name = "e", .dim = base.dim.length };
-    try expectFails(.{ .components = &.{}, .externals = &externals }, error.TooManyExternals);
+    const spec: Spec = .{ .components = &comps };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    try std.testing.expectEqual(@as(u16, 65), plan.n_nodes);
+
+    var small: [8]u8 align(plan_mod.storage_alignment) = undefined;
+    var small_diag: Diagnostic = .{};
+    try std.testing.expectError(error.BufferTooSmall, compileInto(&small, &spec, &small_diag));
+    try std.testing.expect(small_diag.message().len > 0);
 }
 
 test "summing ports accept several sources and none" {
@@ -532,17 +728,19 @@ test "summing ports accept several sources and none" {
             .{ .from = "f2", .to = "mass.force", .gain = -1.0 },
         },
     };
-    var plan: Plan = undefined;
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var diag: Diagnostic = .{};
-    try compile(&spec, &plan, &diag);
-    var ws: plan_mod.Workspace = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
     var dx: [2]f64 = undefined;
-    _ = plan.rhs(&.{ 0.0, 0.0 }, &.{ 10.0, 4.0 }, &ws, &dx);
+    _ = plan.rhs(&.{ 0.0, 0.0 }, &.{ 10.0, 4.0 }, ws, &dx);
     try std.testing.expectEqual(@as(f64, 6.0), dx[0]); // (10 - 4) / 1 kg
 
     const unloaded: Spec = .{ .components = &.{.{ .name = "mass", .component = mass1 }} };
-    try compile(&unloaded, &plan, &diag);
-    _ = plan.rhs(&.{ 0.0, 0.0 }, &.{}, &ws, &dx);
+    const plan2 = try compileForTest(&unloaded, &storage, &diag);
+    const ws2 = plan_mod.Workspace.into(plan2, &ws_storage);
+    _ = plan2.rhs(&.{ 0.0, 0.0 }, &.{}, ws2, &dx);
     try std.testing.expectEqual(@as(f64, 0.0), dx[0]);
 }
 
@@ -552,12 +750,97 @@ test "initial states land in the right place" {
         .{ .name = "m2", .component = mass1 },
         .{ .name = "m3", .component = mass1, .initial_state = &.{ -1.0, 9.0 } },
     } };
-    var plan: Plan = undefined;
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var diag: Diagnostic = .{};
-    try compile(&spec, &plan, &diag);
+    const plan = try compileForTest(&spec, &storage, &diag);
     try std.testing.expectEqual(@as(u16, 6), plan.n_states);
     const expected = [_]f64{ 1.5, 2.5, 0.0, 0.0, -1.0, 9.0 };
     try std.testing.expectEqualSlices(f64, &expected, plan.initial_state[0..6]);
     try std.testing.expectEqual(@as(?u16, 5), plan.stateIndex("m3.position"));
     try std.testing.expectEqual(@as(?u16, 2), plan.signalIndex("m2.velocity"));
+}
+
+/// One gain wired to one external: no states, so the workspace is header plus two slices.
+const gain_spec: Spec = .{
+    .components = &.{.{ .name = "a", .component = gain2 }},
+    .externals = &.{.{ .name = "x", .dim = base.dim.dimensionless }},
+    .connections = &.{.{ .from = "x", .to = "a.x" }},
+};
+
+test "bytesNeeded is exact and one byte less is refused" {
+    const needed = comptime bytesNeeded(&gain_spec);
+    var exact: [needed]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileInto(&exact, &gain_spec, &diag);
+
+    // Every slice is exactly as long as its count, and the header sits at offset 0.
+    try std.testing.expectEqual(@as(usize, 1), plan.external_names.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.order.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.links.len);
+    try std.testing.expectEqual(@as(usize, 2), plan.n_signals);
+    try std.testing.expectEqual(@as(usize, 0), plan.n_states);
+    // The header sits at offset 0 of the caller's buffer.
+    try std.testing.expectEqual(@intFromPtr(&exact), @intFromPtr(plan));
+
+    var short_diag: Diagnostic = .{};
+    try std.testing.expectError(
+        error.BufferTooSmall,
+        compileInto(exact[0 .. needed - 1], &gain_spec, &short_diag),
+    );
+    try std.testing.expect(short_diag.message().len > 0);
+
+    // A zero-state workspace still carries its header, signals and validity slices.
+    const ws_bytes = plan_mod.Workspace.bytesNeeded(plan);
+    try std.testing.expect(ws_bytes >= @sizeOf(plan_mod.Workspace));
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    try std.testing.expectEqual(@as(usize, 2), ws.signals.len);
+    try std.testing.expectEqual(@as(usize, 1), ws.validity.len);
+    _ = plan.evaluate(&.{}, &.{3.0}, ws);
+    try std.testing.expectEqual(@as(f64, 6.0), ws.signals[1]);
+}
+
+test "the same spec in two buffers gives identical plans and signals" {
+    const needed = comptime bytesNeeded(&gain_spec);
+    var buffer_a: [needed]u8 align(plan_mod.storage_alignment) = undefined;
+    var buffer_b: [needed]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan_a = try compileInto(&buffer_a, &gain_spec, &diag);
+    const plan_b = try compileInto(&buffer_b, &gain_spec, &diag);
+
+    try std.testing.expectEqualSlices(u16, plan_a.order, plan_b.order);
+    try std.testing.expectEqual(plan_a.n_links, plan_b.n_links);
+    try std.testing.expectEqualSlices(f64, plan_a.initial_state, plan_b.initial_state);
+
+    var ws_a_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_b_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    const ws_a = plan_mod.Workspace.into(plan_a, &ws_a_storage);
+    const ws_b = plan_mod.Workspace.into(plan_b, &ws_b_storage);
+    _ = plan_a.evaluate(&.{}, &.{1.5}, ws_a);
+    _ = plan_b.evaluate(&.{}, &.{1.5}, ws_b);
+    try std.testing.expectEqualSlices(f64, ws_a.signals, ws_b.signals);
+}
+
+test "one buffer can hold plan A, then plan B" {
+    const spec_b: Spec = .{
+        .components = &.{.{ .name = "b", .component = gain2 }},
+        .externals = &.{.{ .name = "y", .dim = base.dim.dimensionless }},
+        .connections = &.{.{ .from = "y", .to = "b.x" }},
+    };
+    var buffer: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+
+    const plan_a = try compileForTest(&gain_spec, &buffer, &diag);
+    const ws_a = plan_mod.Workspace.into(plan_a, &ws_storage);
+    _ = plan_a.evaluate(&.{}, &.{2.0}, ws_a);
+    const value_a = ws_a.signals[plan_a.signalIndex("a.y").?];
+
+    // Recompiling overwrites `buffer`; `plan_a` is dead from here on.
+    const plan_b = try compileForTest(&spec_b, &buffer, &diag);
+    try std.testing.expectEqual(@as(f64, 4.0), value_a);
+    const ws_b = plan_mod.Workspace.into(plan_b, &ws_storage);
+    _ = plan_b.evaluate(&.{}, &.{5.0}, ws_b);
+    try std.testing.expectEqual(@as(f64, 10.0), ws_b.signals[plan_b.signalIndex("b.y").?]);
 }

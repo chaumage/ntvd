@@ -30,12 +30,15 @@ pub const Model = union(enum) {
     pub const State = struct {};
 
     pub const signature = contract.signature(Model, .{
-        .in_dims = .{
-            .airspeed = base.dim.speed,
-            .alpha = base.dim.angle,
-            .density = base.dim.density,
+        .in = .{
+            .airspeed = contract.scalar(base.dim.speed),
+            .alpha = contract.scalar(base.dim.angle),
+            .density = contract.scalar(base.dim.density),
         },
-        .out_dims = .{ .lift = base.dim.force, .drag = base.dim.force },
+        .out = .{
+            .lift = contract.scalar(base.dim.force),
+            .drag = contract.scalar(base.dim.force),
+        },
         .feedthrough = true,
     });
 

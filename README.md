@@ -56,9 +56,19 @@ const spec: model.Spec = .{
     },
 };
 
-var plan: model.Plan = undefined;       // 82 KB: create once, pass by pointer
+// Storage is caller-owned and exactly sized: ask first, then carve. Nothing is allocated by
+// the core, and evaluation never allocates.
+const needed = model.bytesNeeded(&spec);   // exact byte count for this architecture
+var plan_storage: [256 * 1024]u8 align(model.storage_alignment) = undefined;
+std.debug.assert(needed <= plan_storage.len); // an embedder may size its buffer from `needed`
 var diag: model.Diagnostic = .{};
-try model.compile(&spec, &plan, &diag); // or an error, with diag.message() explaining
+const plan = model.compileInto(&plan_storage, &spec, &diag) catch |err| {
+    // `diag.message()` says what is wrong; `error.BufferTooSmall` means `needed` did not fit.
+    return err;
+};
+
+var ws_storage: [8 * 1024]u8 align(model.storage_alignment) = undefined;
+const ws = model.Workspace.into(plan, &ws_storage);
 ```
 
 To replace the analytic wing by measured wind-tunnel data, change **one value**, from
@@ -72,7 +82,7 @@ top-level directory, so adding a GUI or a CLI never disturbs the solver.
 
 | Directory | Layer | Role |
 |---|---|---|
-| `src/core/base` | L0 | dimensions, units, lookup tables, linear algebra, rng, atmosphere |
+| `src/core/base` | L0 | dimensions, units, geometry, lookup tables, linear algebra, rng, atmosphere |
 | `src/core/components` | L1 | the component contract and the physical models |
 | `src/core/model` | L2 | architecture spec, compiler, immutable evaluation plan |
 | `src/core/solve` | L3 | numerical methods acting on a plan (time integration today) |
@@ -91,6 +101,7 @@ modules it is given in `build.zig`. The same rule is reserved for the planned la
 ## Documents
 
 - [`docs/DESIGN.md`](docs/DESIGN.md): architecture, decisions and their rationale, roadmap
+- [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md): frames, signs, orientation and placement rules
 - [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md): the coding rules and which ones a machine checks
 - [`docs/ADDING_A_COMPONENT.md`](docs/ADDING_A_COMPONENT.md): add a kind or a new model
 

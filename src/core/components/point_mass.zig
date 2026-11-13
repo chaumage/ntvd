@@ -27,10 +27,16 @@ pub const Model = union(enum) {
     pub const State = struct { velocity: f64, position: f64 };
 
     pub const signature = contract.signature(Model, .{
-        .in_dims = .{ .force = base.dim.force },
+        .in = .{ .force = contract.scalar(base.dim.force) },
         .in_sum = .{ .force = true },
-        .out_dims = .{ .velocity = base.dim.speed, .position = base.dim.length },
-        .state_dims = .{ .velocity = base.dim.speed, .position = base.dim.length },
+        .out = .{
+            .velocity = contract.scalar(base.dim.speed),
+            .position = contract.scalar(base.dim.length),
+        },
+        .state = .{
+            .velocity = contract.scalar(base.dim.speed),
+            .position = contract.scalar(base.dim.length),
+        },
         .feedthrough = false,
     });
 
@@ -99,7 +105,7 @@ test "outputs are the states and ignore the input" {
 }
 
 test "the force port sums, the others do not" {
-    try std.testing.expectEqual(contract.FanIn.sum, Model.signature.inputs[0].fan_in);
+    try std.testing.expectEqual(contract.FanIn.sum, Model.signature.inputs[0].ptype.fan_in);
     try std.testing.expect(!Model.signature.feedthrough);
     try std.testing.expectEqual(@as(usize, 2), Model.signature.states.len);
 }
