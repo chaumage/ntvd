@@ -7,7 +7,7 @@
 //!   * functions at most 70 lines
 //!   * every source file opens with a `//!` doc comment saying what it is for
 //!   * `TODO` and `FIXME` must carry an issue reference, `TODO(#123)`
-//!   * no dynamic memory in src/: no allocators, no growable containers
+//!   * no dynamic memory in the core (`src/core/`): no allocators, no growable containers
 //!   * layering: a layer imports only the layers below it, and never by relative path
 //!
 //! A violation is reported with file and line; all violations are listed before failing.
@@ -18,14 +18,27 @@ const max_line_columns = 100;
 const max_fn_lines = 70;
 
 /// Source directory of each layer and the module names it may import besides `std`.
+///
+/// The core layers under `src/core/` are built today. The directories after them are
+/// reserved for layers above the core solver; the same import rules will apply as soon as
+/// they contain Zig code.
 const layers = [_]struct { dir: []const u8, may_import: []const []const u8 }{
-    .{ .dir = "src/base/", .may_import = &.{} },
-    .{ .dir = "src/components/", .may_import = &.{"base"} },
-    .{ .dir = "src/model/", .may_import = &.{ "base", "components" } },
-    .{ .dir = "src/solve/", .may_import = &.{ "base", "model" } },
+    .{ .dir = "src/core/base/", .may_import = &.{} },
+    .{ .dir = "src/core/components/", .may_import = &.{"base"} },
+    .{ .dir = "src/core/model/", .may_import = &.{ "base", "components" } },
+    .{ .dir = "src/core/solve/", .may_import = &.{ "base", "model" } },
+    .{ .dir = "src/analysis/", .may_import = &.{ "base", "model", "solve" } },
+    .{ .dir = "src/optimize/", .may_import = &.{ "base", "model", "solve", "analysis" } },
+    .{ .dir = "src/io/", .may_import = &.{ "base", "model" } },
+    .{ .dir = "src/cli/", .may_import = &.{
+        "base", "model", "solve", "analysis", "optimize", "io",
+    } },
+    .{ .dir = "src/gui/", .may_import = &.{
+        "base", "model", "solve", "analysis", "optimize", "io",
+    } },
 };
 
-const banned_in_src = [_][]const u8{
+const banned_in_core = [_][]const u8{
     "std.heap",
     "Allocator",
     "ArrayList",
@@ -80,6 +93,7 @@ test "source tree follows the style rules" {
 
 fn checkFile(file: []const u8, text: []const u8, report: *Report) void {
     const is_src = std.mem.startsWith(u8, file, "src/");
+    const is_core = std.mem.startsWith(u8, file, "src/core/");
     checkHeader(file, text, report);
 
     var line_no: usize = 0;
@@ -88,10 +102,8 @@ fn checkFile(file: []const u8, text: []const u8, report: *Report) void {
     while (lines.next()) |line| {
         line_no += 1;
         checkLine(file, line_no, line, report);
-        if (is_src) {
-            checkBanned(file, line_no, line, report);
-            checkImports(file, line_no, line, report);
-        }
+        if (is_core) checkBanned(file, line_no, line, report);
+        if (is_src) checkImports(file, line_no, line, report);
         checkFunctionLength(file, line_no, line, &fn_start, report);
     }
 }
@@ -126,9 +138,14 @@ fn checkLine(file: []const u8, n: usize, line: []const u8, report: *Report) void
 
 fn checkBanned(file: []const u8, n: usize, line: []const u8, report: *Report) void {
     if (isComment(line)) return;
-    for (banned_in_src) |word| {
+    for (banned_in_core) |word| {
         if (std.mem.indexOf(u8, line, word) != null) {
-            report.fail(file, n, "'{s}' is banned in src/: the core allocates nothing", .{word});
+            report.fail(
+                file,
+                n,
+                "'{s}' is banned in src/core/: the core allocates nothing",
+                .{word},
+            );
         }
     }
 }
@@ -196,23 +213,23 @@ test "the checker itself flags what it should" {
     const prefix = "//! doc\nconst x = 1; // ";
     @memcpy(long_line[0..prefix.len], prefix);
     @memset(long_line[prefix.len..], 'x');
-    checkFile("src/base/fake.zig", &long_line, &report);
+    checkFile("src/core/base/fake.zig", &long_line, &report);
     try std.testing.expectEqual(@as(u32, 1), report.count);
 
     report = .{ .quiet = true };
-    checkFile("src/base/fake.zig", "const a = 1;\n", &report);
+    checkFile("src/core/base/fake.zig", "const a = 1;\n", &report);
     try std.testing.expectEqual(@as(u32, 1), report.count); // missing header
 
     report = .{ .quiet = true };
-    checkFile("src/base/fake.zig", "//! d\nconst m = @import(\"model\");\n", &report);
+    checkFile("src/core/base/fake.zig", "//! d\nconst m = @import(\"model\");\n", &report);
     try std.testing.expectEqual(@as(u32, 1), report.count); // base may not import model
 
     report = .{ .quiet = true };
     const imports = "//! d\nconst b = @import(\"base\");\nconst z = @import(\"../base/x.zig\");\n";
-    checkFile("src/model/fake.zig", imports, &report);
+    checkFile("src/core/model/fake.zig", imports, &report);
     try std.testing.expectEqual(@as(u32, 1), report.count); // relative import
 
     report = .{ .quiet = true };
-    checkFile("src/base/fake.zig", "//! d\n// TODO fix\nvar a: std.heap.X = 1;\n", &report);
+    checkFile("src/core/base/fake.zig", "//! d\n// TODO fix\nvar a: std.heap.X = 1;\n", &report);
     try std.testing.expectEqual(@as(u32, 2), report.count); // bare TODO, banned heap
 }

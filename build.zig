@@ -1,20 +1,25 @@
-//! Build graph of vehicle-core.
+//! Build graph of ntvd.
 //!
-//! Layering is enforced by the compiler, not by convention. Each layer is a Zig module whose
-//! root file lives in its own directory, and each module only receives the lower layers
-//! listed below. A layer that tries to `@import` a higher one, or to reach into another
-//! layer's directory by relative path, fails to compile.
+//! The core solver lives under `src/core/`. Layering is enforced by the compiler, not by
+//! convention. Each layer is a Zig module whose root file lives in its own directory, and
+//! each module only receives the lower layers listed below. A layer that tries to `@import`
+//! a higher one, or to reach into another layer's directory by relative path, fails to
+//! compile.
 //!
 //!   base        L0   dimensions, tables, linear algebra, rng           (std only)
 //!   components  L1   component contract and physical models            (base)
 //!   model       L2   architecture spec -> validated, compiled plan     (base, components)
 //!   solve       L3   time integration, (later) Newton                  (base, model)
 //!
+//! The directories `src/{analysis,optimize,io,cli,gui}/` are reserved for layers that will
+//! sit above the core solver. They are not built yet; see their READMEs for the plan.
+//!
 //! Steps
 //!   zig build test    all unit, property, fuzz and tidy tests
 //!   zig build check   compile everything without running (fast editor feedback)
 //!   zig build tidy    source style rules only
 //!   zig build fuzz    only the architecture fuzzer (-Dfuzz-iterations=N -Dfuzz-seed=S)
+//!                     add -Dfuzz-verbose=true to print its seed and compiled count
 
 const std = @import("std");
 
@@ -30,16 +35,20 @@ pub fn build(b: *std.Build) void {
     const filters = b.option([]const []const u8, "test-filter", "Only run tests matching") orelse &.{};
     const fuzz_iterations = b.option(u32, "fuzz-iterations", "Random architectures per fuzz run") orelse 20_000;
     const fuzz_seed = b.option(u64, "fuzz-seed", "Seed of the architecture fuzzer") orelse 0x5eed;
+    // A test that writes to stderr makes the Zig 0.17 build runner print the step as if it
+    // had failed, and append a stale "failed command:" line. Keep the fuzzer quiet by
+    // default; opt in when you want its summary.
+    const fuzz_verbose = b.option(bool, "fuzz-verbose", "Print the fuzz summary") orelse false;
 
-    const base = addLayer(b, "base", "src/base/root.zig", target, optimize, &.{});
-    const components = addLayer(b, "components", "src/components/root.zig", target, optimize, &.{
+    const base = addLayer(b, "base", "src/core/base/root.zig", target, optimize, &.{});
+    const components = addLayer(b, "components", "src/core/components/root.zig", target, optimize, &.{
         .{ .name = "base", .module = base },
     });
-    const model = addLayer(b, "model", "src/model/root.zig", target, optimize, &.{
+    const model = addLayer(b, "model", "src/core/model/root.zig", target, optimize, &.{
         .{ .name = "base", .module = base },
         .{ .name = "components", .module = components },
     });
-    const solve = addLayer(b, "solve", "src/solve/root.zig", target, optimize, &.{
+    const solve = addLayer(b, "solve", "src/core/solve/root.zig", target, optimize, &.{
         .{ .name = "base", .module = base },
         .{ .name = "model", .module = model },
     });
@@ -74,6 +83,7 @@ pub fn build(b: *std.Build) void {
     const fuzz_options = b.addOptions();
     fuzz_options.addOption(u32, "iterations", fuzz_iterations);
     fuzz_options.addOption(u64, "seed", fuzz_seed);
+    fuzz_options.addOption(bool, "verbose", fuzz_verbose);
     const fuzz = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/fuzz_model.zig"),
         .target = target,

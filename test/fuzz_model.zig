@@ -11,6 +11,7 @@
 //!
 //! Deterministic by construction: the seed and the iteration count are build options, so a
 //! failure is reproduced with `zig build fuzz -Dfuzz-seed=<seed> -Dfuzz-iterations=<n>`.
+//! Pass `-Dfuzz-verbose=true` to print the seed, iteration count and compiled plan count.
 
 const std = @import("std");
 const base = @import("base");
@@ -297,8 +298,10 @@ test "random architectures: compile is total and plans are sound" {
             }
         }
     }
-    std.debug.print(
-        "fuzz: seed=0x{x} iterations={d} compiled={d}\n",
-        .{ options.seed, options.iterations, compiled },
-    );
+    if (options.verbose) {
+        std.debug.print(
+            "fuzz: seed=0x{x} iterations={d} compiled={d}\n",
+            .{ options.seed, options.iterations, compiled },
+        );
+    }
 }

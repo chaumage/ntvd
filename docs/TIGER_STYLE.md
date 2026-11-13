@@ -13,7 +13,7 @@ machine** (`zig build tidy`, also part of `zig build test`) versus left to revie
 | Functions at most 70 lines | a function fits in one screen and one head |
 | Every source file opens with a `//!` comment | each file says what it is for |
 | `TODO`/`FIXME` carry an issue: `TODO(#123)` | no anonymous promises |
-| No allocators or growable containers in `src/` | the core allocates nothing after startup |
+| No allocators or growable containers in `src/core/` | the core allocates nothing after startup |
 | A layer imports only the layers below it; no relative imports across layers | architecture enforced, not drawn |
 
 The checker has a self-test that proves each rule fires on a bad input. A rule that needs
@@ -21,9 +21,9 @@ judgment does not belong in it.
 
 ## Practiced, reviewed by people
 
-**Static allocation.** Capacities live in `base/limits.zig`. Data that comes from the outside
-world and can exceed a limit returns a precise error (`error.Full`, `TooManyComponents`);
-a limit the caller guarantees is an assertion.
+**Static allocation.** Capacities live in `src/core/base/limits.zig`. Data that comes from the
+outside world and can exceed a limit returns a precise error (`error.Full`,
+`TooManyComponents`); a limit the caller guarantees is an assertion.
 
 **Assertions.** Assert preconditions, postconditions and invariants, at least two per
 non-trivial function, and across the boundary of every function that takes external data.
@@ -39,7 +39,7 @@ Assertions are on in Debug and `ReleaseSafe`. Run anything long in `ReleaseSafe`
 
 **Bounded everything.** No recursion. Every loop has a static upper bound, and a bound that
 cannot be reached in a correct program ends in `unreachable` (see the binary search in
-`base/interp.zig`). Every iterative solver takes a maximum iteration count.
+`src/core/base/interp.zig`). Every iterative solver takes a maximum iteration count.
 
 **NaN is a bug, never a result.** Components return finite numbers for finite inputs and
 flag the quality of the answer with `Validity`. `Plan` evaluation is total (see DESIGN D5).
@@ -74,5 +74,5 @@ loops to single examples. A bug becomes a test before it becomes a fix.
   before committing.
 - A struct holding slices only *borrows* them. Returning a `Spec` built from `&.{ ... }`
   containing runtime values dangles: return the backing array by value and borrow it in the
-  caller (see `falling_body.components` in `model/scenarios.zig`).
+  caller (see `falling_body.components` in `src/core/model/scenarios.zig`).
 - `std.testing.io` provides an `Io` for tests that touch the filesystem.

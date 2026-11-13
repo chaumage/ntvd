@@ -8,7 +8,7 @@ Two operations: add a **model** to an existing kind (a new fidelity level), or a
 Example: a lift surface whose polars come from a lifting-line solver, as a closed form with
 different parameters. Say it is called `swept_linear`.
 
-1. In the kind's file (`src/components/lift_surface.zig`), define the model struct with its
+1. In the kind's file (`src/core/components/lift_surface.zig`), define the model struct with its
    parameters and three functions:
    ```zig
    pub const SweptLinear = struct {
@@ -38,7 +38,7 @@ the check that the abstraction is right.
 
 Example: `hull_resistance` (speed, density -> drag).
 
-1. Create `src/components/hull_resistance.zig` with the file header comment, then:
+1. Create `src/core/components/hull_resistance.zig` with the file header comment, then:
    ```zig
    pub const Model = union(enum) {
        viscous_form: ViscousForm,
@@ -60,8 +60,8 @@ Example: `hull_resistance` (speed, density -> drag).
    Every field of `In`, `Out` and `State` must be `f64` and must appear in the dimension
    lists; the compiler tells you precisely what is missing. Mark inputs that add up (forces)
    with `.in_sum = .{ .force = true }`.
-2. Register it in `src/components/registry.zig` (one import, one union field) and in
-   `src/components/root.zig`. The compiler then points at every place that must learn about
+2. Register it in `src/core/components/registry.zig` (one import, one union field) and in
+   `src/core/components/root.zig`. The compiler then points at every place that must learn about
    it, and `assertKind` checks the contract at compile time.
 3. Write the tests listed in section A, including `expectKindContract` for every model.
 

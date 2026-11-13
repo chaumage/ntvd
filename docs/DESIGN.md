@@ -21,6 +21,7 @@ Out of scope for the core: user interface, file formats, plotting. They are shel
 ## 2. Layers
 
 ```
+src/core/               the solver (built today)
   L3  solve        time integration; (planned) Newton, trim, algebraic loops
   L2  model        Spec -> compile -> Plan (+ Workspace)
   L1  components   contract + kinds (air, gain, lift_surface, point_mass, thruster)
@@ -31,7 +32,9 @@ Dependencies point down only. `build.zig` creates one Zig module per layer and p
 only the lower layers it may use, so a violation does not compile. `test/tidy.zig` repeats the
 rule as a check on import statements, and forbids relative imports across layers.
 
-Planned above L3: `analysis` (trim, sweeps, missions), `optimize`, `io`, and a C ABI.
+Planned above L3, each with its own directory under `src/`: `analysis/` (trim, sweeps,
+missions), `optimize/`, `io/`, `cli/`, `gui/`, and eventually a C ABI. They are empty except
+for a README until the solver work that motivates them lands.
 
 ## 3. Decisions
 
@@ -129,18 +132,18 @@ boundary (`base.units`).
 
 ### D7. Static memory
 
-`base/limits.zig` fixes the capacity of everything (components, ports, links, table points,
-unknowns). Nothing in `src/` allocates; `tidy` bans allocators and growable containers. A
-model that does not fit is rejected up front with a precise error. Sizes today: a `Plan` is
-82 KB, a `Workspace` 4.4 KB; create a plan once and pass it by pointer.
+`src/core/base/limits.zig` fixes the capacity of everything (components, ports, links, table
+points, unknowns). Nothing in `src/core/` allocates; `tidy` bans allocators and growable
+containers there. A model that does not fit is rejected up front with a precise error. Sizes
+today: a `Plan` is 82 KB, a `Workspace` 4.4 KB; create a plan once and pass it by pointer.
 
 ### D8. Determinism
 
 No wall-clock, no global state, no hash-map iteration order. The random generator is
-implemented in `base/rng.zig` (xoshiro256++ seeded by SplitMix64) rather than taken from
-`std`, because the standard library may change its generators between releases and golden
-tests need a sequence that never moves. A test pins it to the standard library's today.
-The same input gives bit-identical output, so every failure reproduces from a seed.
+implemented in `src/core/base/rng.zig` (xoshiro256++ seeded by SplitMix64) rather than taken
+from `std`, because the standard library may change its generators between releases and
+golden tests need a sequence that never moves. A test pins it to the standard library's
+today. The same input gives bit-identical output, so every failure reproduces from a seed.
 
 ### D9. Algebraic loops are rejected for now
 
@@ -166,8 +169,8 @@ solves for.
 |---|---|---|
 | Unit | each file | analytic cases, hand calculations, tables reproduce linear/bilinear data exactly |
 | Contract property | `contract.expectKindContract` | every model of every kind: finite, deterministic, feedthrough honest |
-| Scenario | `model/scenarios.zig` | physical loop compiles; model swap leaves wiring identical; totality under NaN/inf |
-| Dynamics | `solve/integrate.zig` | RK4 vs analytic terminal-velocity solution; measured 4th-order convergence; divergence handling |
+| Scenario | `src/core/model/scenarios.zig` | physical loop compiles; model swap leaves wiring identical; totality under NaN/inf |
+| Dynamics | `src/core/solve/integrate.zig` | RK4 vs analytic terminal-velocity solution; measured 4th-order convergence; divergence handling |
 | Fuzz | `test/fuzz_model.zig` | random valid and invalid architectures: compile never crashes, plans are sound, evaluation is total; checks that its own generator reaches each error class |
 | Style | `test/tidy.zig` | the rules in `TIGER_STYLE.md` |
 
