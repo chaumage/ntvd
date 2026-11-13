@@ -1,0 +1,15 @@
+.{
+    .name = .vehicle_core,
+    .fingerprint = 0x1910b6136014be30,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test",
+        "docs",
+        "README.md",
+    },
+}
