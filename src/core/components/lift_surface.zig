@@ -48,9 +48,14 @@ pub const Model = union(enum) {
         };
     }
 
-    pub fn outputs(self: *const Model, x: State, u: In) contract.Evaluated(Out) {
+    pub fn outputs(
+        self: *const Model,
+        x: State,
+        u: In,
+        ctx: contract.Context,
+    ) contract.Evaluated(Out) {
         return switch (self.*) {
-            inline else => |*m| m.outputs(x, u),
+            inline else => |*m| m.outputs(x, u, ctx),
         };
     }
 };
@@ -87,8 +92,14 @@ pub const Linear = struct {
         return null;
     }
 
-    pub fn outputs(self: *const Linear, x: Model.State, u: Model.In) contract.Evaluated(Model.Out) {
+    pub fn outputs(
+        self: *const Linear,
+        x: Model.State,
+        u: Model.In,
+        ctx: contract.Context,
+    ) contract.Evaluated(Model.Out) {
         _ = x;
+        _ = ctx;
         contract.assertFiniteFields(u);
         assert(self.area_m2 > 0.0 and self.aspect_ratio > 0.0 and self.oswald > 0.0);
         if (u.airspeed < 0.0 or u.density < 0.0) return impossible;
@@ -124,8 +135,10 @@ pub const PolarTable = struct {
         self: *const PolarTable,
         x: Model.State,
         u: Model.In,
+        ctx: contract.Context,
     ) contract.Evaluated(Model.Out) {
         _ = x;
+        _ = ctx;
         contract.assertFiniteFields(u);
         assert(self.area_m2 > 0.0);
         if (u.airspeed < 0.0 or u.density < 0.0) return impossible;
@@ -159,7 +172,7 @@ const sample_flow: Model.In = .{ .airspeed = 30.0, .alpha = 0.05, .density = 1.2
 
 test "linear wing against a hand calculation" {
     const m: Model = .{ .linear = sampleWing() };
-    const r = m.outputs(.{}, sample_flow);
+    const r = m.outputs(.{}, sample_flow, .{});
     // q = 0.5 * 1.225 * 30^2 = 551.25 Pa;  CL = 5 * 0.05 = 0.25
     // lift = 551.25 * 1.2 * 0.25 = 165.375 N
     // CD = 0.02 + 0.25^2 / (pi * 0.9 * 8) = 0.0227631...;  drag = 551.25 * 1.2 * CD
@@ -175,7 +188,7 @@ test "an elliptic wing has induced drag CL^2 / (pi AR)" {
     wing.oswald = 1.0;
     const m: Model = .{ .linear = wing };
     const u: Model.In = .{ .airspeed = 25.0, .alpha = 0.1, .density = 1.1 };
-    const r = m.outputs(.{}, u);
+    const r = m.outputs(.{}, u, .{});
     const cl = r.value.lift / (0.5 * u.density * u.airspeed * u.airspeed * wing.area_m2);
     const cdi = r.value.drag / (0.5 * u.density * u.airspeed * u.airspeed * wing.area_m2);
     try std.testing.expectApproxEqRel(cl * cl / (std.math.pi * wing.aspect_ratio), cdi, 1e-12);
@@ -196,14 +209,14 @@ test "forces scale with area, density and speed squared" {
         bigger.area_m2 *= k;
         const scaled_area: Model = .{ .linear = bigger };
 
-        const a = one.outputs(.{}, u).value;
-        const b = scaled_area.outputs(.{}, u).value;
+        const a = one.outputs(.{}, u, .{}).value;
+        const b = scaled_area.outputs(.{}, u, .{}).value;
         try std.testing.expectApproxEqRel(k * a.lift, b.lift, 1e-12);
         try std.testing.expectApproxEqRel(k * a.drag, b.drag, 1e-12);
 
         var faster = u;
         faster.airspeed *= k;
-        const c = one.outputs(.{}, faster).value;
+        const c = one.outputs(.{}, faster, .{}).value;
         try std.testing.expectApproxEqRel(k * k * a.lift, c.lift, 1e-12);
     }
 }
@@ -212,26 +225,26 @@ test "beyond stall the result is clamped and flagged" {
     const m: Model = .{ .linear = sampleWing() };
     var u = sample_flow;
     u.alpha = 0.3;
-    const at_stall = m.outputs(.{}, u);
+    const at_stall = m.outputs(.{}, u, .{});
     try std.testing.expectEqual(base.Validity.valid, at_stall.validity);
     u.alpha = 0.6;
-    const past = m.outputs(.{}, u);
+    const past = m.outputs(.{}, u, .{});
     try std.testing.expectEqual(base.Validity.beyond_envelope, past.validity);
     try std.testing.expectEqual(at_stall.value.lift, past.value.lift);
     u.alpha = -0.6;
-    try std.testing.expectEqual(base.Validity.beyond_envelope, m.outputs(.{}, u).validity);
+    try std.testing.expectEqual(base.Validity.beyond_envelope, m.outputs(.{}, u, .{}).validity);
 }
 
 test "impossible conditions are flagged invalid with zero forces" {
     const m: Model = .{ .linear = sampleWing() };
     var u = sample_flow;
     u.density = -1.0;
-    const r = m.outputs(.{}, u);
+    const r = m.outputs(.{}, u, .{});
     try std.testing.expectEqual(base.Validity.invalid, r.validity);
     try std.testing.expectEqual(@as(f64, 0.0), r.value.lift);
     u = sample_flow;
     u.airspeed = -3.0;
-    try std.testing.expectEqual(base.Validity.invalid, m.outputs(.{}, u).validity);
+    try std.testing.expectEqual(base.Validity.invalid, m.outputs(.{}, u, .{}).validity);
 }
 
 /// A polar table sampled from the analytic wing: the "measured" data of these tests.
@@ -265,8 +278,8 @@ test "a table sampled from the analytic model gives nearly the same answer" {
             .alpha = rng.range(-0.3, 0.3),
             .density = rng.range(0.8, 1.3),
         };
-        const a = analytic.outputs(.{}, u);
-        const b = measured.outputs(.{}, u);
+        const a = analytic.outputs(.{}, u, .{});
+        const b = measured.outputs(.{}, u, .{});
         try std.testing.expectEqual(base.Validity.valid, b.validity);
         // CL is linear in alpha, so interpolation reproduces it exactly.
         try std.testing.expectApproxEqAbs(a.value.lift, b.value.lift, 1e-9);
@@ -279,7 +292,10 @@ test "outside the measured alpha range the table flags the result" {
     const measured: Model = .{ .polar_table = try sampledPolar(sampleWing()) };
     var u = sample_flow;
     u.alpha = 0.9;
-    try std.testing.expectEqual(base.Validity.beyond_envelope, measured.outputs(.{}, u).validity);
+    try std.testing.expectEqual(
+        base.Validity.beyond_envelope,
+        measured.outputs(.{}, u, .{}).validity,
+    );
 }
 
 test "lift surface parameters are validated" {

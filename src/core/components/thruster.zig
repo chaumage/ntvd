@@ -43,9 +43,14 @@ pub const Model = union(enum) {
         };
     }
 
-    pub fn outputs(self: *const Model, x: State, u: In) contract.Evaluated(Out) {
+    pub fn outputs(
+        self: *const Model,
+        x: State,
+        u: In,
+        ctx: contract.Context,
+    ) contract.Evaluated(Out) {
         return switch (self.*) {
-            inline else => |*m| m.outputs(x, u),
+            inline else => |*m| m.outputs(x, u, ctx),
         };
     }
 };
@@ -78,8 +83,10 @@ pub const LinearDecay = struct {
         self: *const LinearDecay,
         x: Model.State,
         u: Model.In,
+        ctx: contract.Context,
     ) contract.Evaluated(Model.Out) {
         _ = x;
+        _ = ctx;
         contract.assertFiniteFields(u);
         assert(self.static_thrust_n > 0.0 and self.max_speed_ms > 0.0);
         if (u.airspeed < 0.0) return impossible;
@@ -111,8 +118,10 @@ pub const SpeedTable = struct {
         self: *const SpeedTable,
         x: Model.State,
         u: Model.In,
+        ctx: contract.Context,
     ) contract.Evaluated(Model.Out) {
         _ = x;
+        _ = ctx;
         contract.assertFiniteFields(u);
         if (u.airspeed < 0.0) return impossible;
 
@@ -135,12 +144,12 @@ fn sampleThruster() LinearDecay {
 
 test "linear decay thrust at known points" {
     const m: Model = .{ .linear_decay = sampleThruster() };
-    const static = m.outputs(.{}, .{ .airspeed = 0.0, .throttle = 1.0 });
+    const static = m.outputs(.{}, .{ .airspeed = 0.0, .throttle = 1.0 }, .{});
     try std.testing.expectEqual(@as(f64, 40.0), static.value.thrust);
     try std.testing.expectEqual(base.Validity.valid, static.validity);
-    const half = m.outputs(.{}, .{ .airspeed = 30.0, .throttle = 1.0 });
+    const half = m.outputs(.{}, .{ .airspeed = 30.0, .throttle = 1.0 }, .{});
     try std.testing.expectApproxEqAbs(@as(f64, 20.0), half.value.thrust, 1e-12);
-    const at_vmax = m.outputs(.{}, .{ .airspeed = 60.0, .throttle = 1.0 });
+    const at_vmax = m.outputs(.{}, .{ .airspeed = 60.0, .throttle = 1.0 }, .{});
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), at_vmax.value.thrust, 1e-12);
     try std.testing.expectEqual(base.Validity.valid, at_vmax.validity);
 }
@@ -151,8 +160,8 @@ test "thrust is linear in the throttle and never negative" {
     for (0..2000) |_| {
         const v = rng.range(0.0, 100.0);
         const k = rng.range(0.0, 1.0);
-        const full = m.outputs(.{}, .{ .airspeed = v, .throttle = 1.0 }).value.thrust;
-        const part = m.outputs(.{}, .{ .airspeed = v, .throttle = k }).value.thrust;
+        const full = m.outputs(.{}, .{ .airspeed = v, .throttle = 1.0 }, .{}).value.thrust;
+        const part = m.outputs(.{}, .{ .airspeed = v, .throttle = k }, .{}).value.thrust;
         try std.testing.expectApproxEqAbs(k * full, part, 1e-12);
         try std.testing.expect(part >= 0.0);
     }
@@ -160,14 +169,14 @@ test "thrust is linear in the throttle and never negative" {
 
 test "out of range throttle and speed are flagged" {
     const m: Model = .{ .linear_decay = sampleThruster() };
-    const over = m.outputs(.{}, .{ .airspeed = 10.0, .throttle = 1.5 });
+    const over = m.outputs(.{}, .{ .airspeed = 10.0, .throttle = 1.5 }, .{});
     try std.testing.expectEqual(base.Validity.beyond_envelope, over.validity);
-    const full = m.outputs(.{}, .{ .airspeed = 10.0, .throttle = 1.0 });
+    const full = m.outputs(.{}, .{ .airspeed = 10.0, .throttle = 1.0 }, .{});
     try std.testing.expectEqual(full.value.thrust, over.value.thrust);
-    const fast = m.outputs(.{}, .{ .airspeed = 90.0, .throttle = 1.0 });
+    const fast = m.outputs(.{}, .{ .airspeed = 90.0, .throttle = 1.0 }, .{});
     try std.testing.expectEqual(base.Validity.beyond_envelope, fast.validity);
     try std.testing.expectEqual(@as(f64, 0.0), fast.value.thrust);
-    const backwards = m.outputs(.{}, .{ .airspeed = -1.0, .throttle = 1.0 });
+    const backwards = m.outputs(.{}, .{ .airspeed = -1.0, .throttle = 1.0 }, .{});
     try std.testing.expectEqual(base.Validity.invalid, backwards.validity);
 }
 
@@ -189,8 +198,8 @@ test "a measured table reproduces the analytic model it was sampled from" {
     var rng = base.Rng.init(6);
     for (0..2000) |_| {
         const u: Model.In = .{ .airspeed = rng.range(0.0, 60.0), .throttle = rng.range(0.0, 1.0) };
-        const a = analytic.outputs(.{}, u);
-        const b = measured.outputs(.{}, u);
+        const a = analytic.outputs(.{}, u, .{});
+        const b = measured.outputs(.{}, u, .{});
         try std.testing.expectApproxEqAbs(a.value.thrust, b.value.thrust, 1e-9);
         try std.testing.expectEqual(base.Validity.valid, b.validity);
     }
@@ -198,7 +207,7 @@ test "a measured table reproduces the analytic model it was sampled from" {
 
 test "beyond the last table point the table flags the result" {
     const measured: Model = .{ .speed_table = try sampledTable() };
-    const r = measured.outputs(.{}, .{ .airspeed = 75.0, .throttle = 1.0 });
+    const r = measured.outputs(.{}, .{ .airspeed = 75.0, .throttle = 1.0 }, .{});
     try std.testing.expectEqual(base.Validity.beyond_envelope, r.validity);
     try std.testing.expect(std.math.isFinite(r.value.thrust));
 }

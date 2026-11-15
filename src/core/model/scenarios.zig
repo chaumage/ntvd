@@ -235,7 +235,7 @@ test "evaluation is total: garbage in gives finite signals and an invalid flag" 
             for (exts) |e| {
                 const v = plan.rhs(&x, &e, ws, &dx);
                 // Component outputs and derivatives are always finite.
-                for (ws.signals[plan.n_externals..plan.n_signals]) |s| {
+                for (ws.signals[plan.n_external_slots..plan.n_signals]) |s| {
                     try std.testing.expect(std.math.isFinite(s));
                 }
                 for (dx) |d| try std.testing.expect(std.math.isFinite(d));

@@ -15,12 +15,26 @@
 const base = @import("base");
 const components = @import("components");
 
+const contract = components.contract;
+
 pub const Component = components.Component;
+
+/// Where a component sits in the vehicle, and how it is turned. Both are relative to the body
+/// frame: the vehicle's pose is the body's state, and the assembly is fixed.
+pub const Placement = struct {
+    /// Position of the component's origin in the body frame, metres.
+    position_m: base.Vec3 = .{},
+    /// Orientation of the local frame relative to the body frame, radians, intrinsic Z-Y-X
+    /// (roll, pitch, yaw).
+    attitude_rad: base.Vec3 = .{},
+};
 
 pub const ComponentSpec = struct {
     name: []const u8,
     component: Component,
-    /// Initial values of the component's states, in declaration order. Empty means all zero.
+    placement: Placement = .{},
+    /// Initial values of the component's states, in declaration order. Empty means defaults:
+    /// zero for scalars and vectors, identity for quaternions.
     initial_state: []const f64 = &.{},
 };
 
@@ -28,6 +42,20 @@ pub const ComponentSpec = struct {
 pub const ExternalSpec = struct {
     name: []const u8,
     dim: base.Dim,
+    /// Layout of the signal. A vector external declares its shape, quantity and frame; a
+    /// scalar leaves the defaults.
+    shape: contract.Shape = .scalar,
+    quantity: contract.Quantity = .scalar,
+    frame: contract.Frame = .none,
+};
+
+/// How a connection attaches its source to its target.
+pub const Attachment = enum {
+    /// A plain signal link. Cross-frame vectors are rotated by a generated node.
+    signal,
+    /// A rigid attachment of the source component to the vehicle: a wrench delivered to the
+    /// body's mount point and translated by the source's placement.
+    rigid,
 };
 
 pub const ConnectionSpec = struct {
@@ -38,6 +66,7 @@ pub const ConnectionSpec = struct {
     /// Dimensionless factor applied to the signal, typically -1 to turn a drag magnitude into
     /// a force along the axis. Applied to every source of a summing input individually.
     gain: f64 = 1.0,
+    attachment: Attachment = .signal,
 };
 
 pub const Spec = struct {

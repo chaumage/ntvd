@@ -66,7 +66,7 @@ in the implementation plan, and the table is not complete until their tests exis
 | positive roll rate `p` | right wing down | Phase 4 |
 | positive pitch rate `q` | nose up | Phase 4 |
 | positive yaw rate `r` | nose right | Phase 4 |
-| force `F = (1, 0, 0)` at `r = (0, 0, -0.4)` (above the CG, z is down) | moment `-y` (`r × F`), nose down | Phase 3 |
+| force `F = (1, 0, 0)` at `r = (0, 0, -0.4)` (above the CG, z is down) | moment `-y` (`r × F`), nose down | `compile: a rigid wrench at an offset` |
 | gravity at level attitude | body force `(0, 0, +m g)` | Phase 4 |
 | positive yaw of 90° | body `+x` maps to world `+y` | `Quat: identity and basis rotations` |
 | positive pitch of 90° | body `+x` maps to world `-z` (up) | `Quat: identity and basis rotations` |
@@ -84,7 +84,13 @@ A component is attached to the vehicle with **one** connection:
 - The source is a `wrench` output in the component's local frame.
 - The destination is the designated body's wrench summing input, in the body frame.
 - `compile` generates one mount node from the source's placement, applying the transform of
-  §2. There is no implicit second link and no separate force/moment wiring.
+  §2. There is no implicit second link and no separate force/moment wiring. The node is
+  ordinary and inspectable as `__x_<n>`; its `wrench` output is what drives `body.mount`.
+- A component attaches at most once: a second `.rigid` wire from the same component is
+  `MultiplyDriven`. Different components may all attach to the same mount, whose
+  contributions add.
+- A non-wrench source is `RigidAttachmentNotWrench`; a destination other than the body's mount
+  is `RigidAttachmentToNonBody`; a rigid attachment with no designated body is `AmbiguousBody`.
 - The connection `gain` is dimensionless and applies to the whole wrench; normally `1.0`.
   Reverse a sign in the component's local vectors, not in the attachment.
 

@@ -14,14 +14,19 @@ different parameters. Say it is called `swept_linear`.
    pub const SweptLinear = struct {
        // parameters, SI units, units in the names
        pub fn validate(self: *const SweptLinear) contract.ParamCheck { ... }
-       pub fn outputs(self: *const SweptLinear, x: Model.State, u: Model.In)
-           contract.Evaluated(Model.Out) { ... }
+       pub fn outputs(
+           self: *const SweptLinear,
+           x: Model.State,
+           u: Model.In,
+           ctx: contract.Context,
+       ) contract.Evaluated(Model.Out) { ... }
    };
    ```
 2. Add it as a variant of the kind's `Model` union, and a branch in `validate`/`outputs`
    (the `inline else` already covers it).
-3. Document at the top of the file: the equations, the validity range, and what is returned
-   outside it.
+3. Document at the top of the file: the local frame's axes, the equations, the validity
+   range, and what is returned outside it. The compiler supplies the component's placement
+   through `ctx`; the kind states its axes and parameters in that local frame.
 4. Tests, in the same file:
    - a hand-calculated case (arithmetic in a comment)
    - the scaling/monotonicity property that physics demands
@@ -66,6 +71,11 @@ Example: `hull_resistance` (speed, density -> drag).
    `contract.wrench(frame)` for wide ports: the shape is derived from the field type and
    checked against the declared one. Mark inputs that add up (forces) with
    `.in_sum = .{ .force = true }`.
+   `outputs` and `derivatives` take a `contract.Context` as their last argument. It carries
+   the placement the compiler resolved for this component (its local frame's position and
+   orientation in the body frame); a kind that works purely in its own frame ignores it.
+   A kind that reads a world or body-frame signal is wired through generated transform nodes,
+   not by doing frame math itself.
 2. Register it in `src/core/components/registry.zig` (one import, one union field) and in
    `src/core/components/root.zig`. The compiler then points at every place that must learn about
    it, and `assertKind` checks the contract at compile time.
@@ -86,6 +96,8 @@ replacing the inputs with NaN.
 
 - [ ] `zig build test` passes in Debug and with `-Doptimize=ReleaseSafe`
 - [ ] `zig fmt --check build.zig src test` is clean
-- [ ] file header documents equations, validity range, behavior outside it
+- [ ] file header documents the local frame's axes, equations, validity range, behavior
+      outside it
 - [ ] no allocation, no recursion, every loop bounded
+- [ ] names avoid the `__x_` prefix, which is reserved for generated transform nodes
 - [ ] a bug found along the way has its own test

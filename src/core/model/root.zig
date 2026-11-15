@@ -18,6 +18,8 @@ pub const Spec = spec.Spec;
 pub const ComponentSpec = spec.ComponentSpec;
 pub const ConnectionSpec = spec.ConnectionSpec;
 pub const ExternalSpec = spec.ExternalSpec;
+pub const Placement = spec.Placement;
+pub const Attachment = spec.Attachment;
 pub const Component = spec.Component;
 
 pub const Plan = plan.Plan;

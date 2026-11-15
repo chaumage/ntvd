@@ -20,6 +20,7 @@ pub const Vec3 = geometry.Vec3;
 pub const Quat = geometry.Quat;
 pub const Wrench = geometry.Wrench;
 pub const Rotation = geometry.Rotation;
+pub const Placement = geometry.Placement;
 
 test {
     _ = @import("limits.zig");

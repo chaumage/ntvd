@@ -4,7 +4,8 @@
 //! compile time, so evaluation has no error paths:
 //!
 //!   * every input port is wired as its signature demands,
-//!   * every connection joins ports of identical dimension,
+//!   * every connection joins ports of compatible shape and quantity; a cross-frame vector
+//!     passes through a generated `frame_transform` node,
 //!   * the nodes are in an order where every feedthrough component comes after its sources.
 //!
 //! Evaluation is *total*: for any input, even NaN or infinity, it returns finite signals and
@@ -13,8 +14,8 @@
 //! what lets solvers and optimizers probe nonsense without crashing the process.
 //!
 //! Signals and states
-//!   signals   one flat array: the externals first, then the outputs of each component
-//!             in declaration order
+//!   signals   one flat array: the externals first, then the outputs of each authored
+//!             component in declaration order, then those of generated nodes
 //!   states    one flat array: the states of each component in declaration order
 //!
 //! Dynamics are split in two phases so that an integrator or a nonlinear solver can use
@@ -62,6 +63,9 @@ pub const InputWiring = struct {
 pub const Node = struct {
     name: Name,
     component: Component,
+    /// Placement of the component's local frame in the body frame. Generated nodes use the
+    /// identity; the transform itself is stored in the component value.
+    placement: base.Placement,
     /// Total input slots of this node, the sum of the port widths.
     n_in: u8,
     /// Total output slots, the sum of the port widths.
@@ -71,7 +75,7 @@ pub const Node = struct {
     /// Offset of this node's first state slot in the state array.
     state_offset: u16,
     /// Offset of this node's first output slot; the signal index is
-    /// `n_externals + out_offset`.
+    /// `n_external_slots + out_offset`.
     out_offset: u16,
     inputs: [limits.max_ports]InputWiring,
 };
@@ -80,7 +84,9 @@ pub const Node = struct {
 /// from the caller's storage by `compileInto`.
 pub const Plan = struct {
     external_names: []Name,
-    external_dims: []Dim,
+    external_ptypes: []contract.PortType,
+    /// Offset of each external's first slot in the signal array.
+    external_offsets: []u16,
 
     nodes: []Node,
     /// Node indices in evaluation order.
@@ -93,6 +99,8 @@ pub const Plan = struct {
     attitude_states: []u16,
 
     n_externals: u16,
+    /// Total slots occupied by all externals; the first component output follows them.
+    n_external_slots: u16,
     n_nodes: u16,
     n_links: u16,
     n_states: u16,
@@ -107,10 +115,10 @@ pub const Plan = struct {
         ws: *Workspace,
     ) Validity {
         assert(x.len == plan.n_states);
-        assert(externals.len == plan.n_externals);
+        assert(externals.len == plan.n_external_slots);
         assert(ws.signals.len == plan.n_signals);
         assert(ws.validity.len == plan.n_nodes);
-        @memcpy(ws.signals[0..plan.n_externals], externals);
+        @memcpy(ws.signals[0..plan.n_external_slots], externals);
 
         var worst: Validity = .valid;
         for (plan.order[0..plan.n_nodes]) |index| {
@@ -133,7 +141,7 @@ pub const Plan = struct {
         assert(dx.len == plan.n_states);
 
         var worst: Validity = .valid;
-        for (plan.nodes) |*node| {
+        for (plan.nodes[0..plan.n_nodes]) |*node| {
             if (node.n_state == 0) continue;
             worst = worst.worst(plan.derivativesNode(node, x, ws, dx));
         }
@@ -160,12 +168,13 @@ pub const Plan = struct {
         if (node.component.signature().feedthrough) plan.gather(node, ws, u[0..n_in]);
 
         const xs = x[node.state_offset..][0..node.n_state];
-        const out = ws.signals[plan.n_externals + node.out_offset ..][0..node.n_out];
+        const out = ws.signals[plan.n_external_slots + node.out_offset ..][0..node.n_out];
         if (!allFinite(xs) or !allFinite(u[0..n_in])) {
             @memset(out, 0.0);
             return .invalid;
         }
-        const v = node.component.outputs(xs, u[0..n_in], out);
+        const ctx: contract.Context = .{ .placement = node.placement };
+        const v = node.component.outputs(xs, u[0..n_in], out, ctx);
         if (!allFinite(out)) {
             @memset(out, 0.0);
             return .invalid;
@@ -190,7 +199,7 @@ pub const Plan = struct {
             @memset(d, 0.0);
             return .invalid;
         }
-        const v = node.component.derivatives(xs, u[0..n_in], d);
+        const v = node.component.derivatives(xs, u[0..n_in], d, .{ .placement = node.placement });
         if (!allFinite(d)) {
             @memset(d, 0.0);
             return .invalid;
@@ -238,13 +247,13 @@ pub const Plan = struct {
     /// slot; use `signalSlots` when the width matters.
     pub fn signalIndex(plan: *const Plan, text: []const u8) ?u16 {
         const p = path.parse(text) catch return null;
-        const port = p.port orelse return plan.externalIndex(p.head);
+        const port = p.port orelse return plan.externalOffsets(p.head);
         const ni = plan.nodeIndex(p.head) orelse return null;
         const node = &plan.nodes[ni];
         const sig = node.component.signature();
         const oi = sig.outputIndex(port) orelse return null;
         const slot = contract.slotsBefore(sig.outputs, oi);
-        return plan.n_externals + node.out_offset + slot;
+        return plan.n_external_slots + node.out_offset + slot;
     }
 
     /// First signal index and slot width of "external" or "component.output".
@@ -254,7 +263,7 @@ pub const Plan = struct {
         const p = path.parse(text) catch return null;
         const port = p.port orelse {
             const i = plan.externalIndex(p.head) orelse return null;
-            return .{ .index = i, .width = 1 };
+            return .{ .index = plan.external_offsets[i], .width = plan.external_ptypes[i].width() };
         };
         const ni = plan.nodeIndex(p.head) orelse return null;
         const node = &plan.nodes[ni];
@@ -262,9 +271,14 @@ pub const Plan = struct {
         const oi = sig.outputIndex(port) orelse return null;
         const slot = contract.slotsBefore(sig.outputs, oi);
         return .{
-            .index = plan.n_externals + node.out_offset + slot,
+            .index = plan.n_external_slots + node.out_offset + slot,
             .width = sig.outputs[oi].ptype.width(),
         };
+    }
+
+    fn externalOffsets(plan: *const Plan, name: []const u8) ?u16 {
+        const i = plan.externalIndex(name) orelse return null;
+        return plan.external_offsets[i];
     }
 
     /// Index of "component.state" in the state array. For a wide state this is its first slot.

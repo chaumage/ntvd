@@ -90,6 +90,12 @@ pub const Port = struct {
     ptype: PortType,
 };
 
+/// Per-component information supplied by the compiled plan, never stored in the model.
+/// A kind that needs its own placement reads it here; kinds that do not use it ignore it.
+pub const Context = struct {
+    placement: base.Placement = .{},
+};
+
 /// A scalar port: one slot, no frame.
 pub fn scalar(dim: Dim) PortType {
     return .{ .dim = dim };
@@ -358,6 +364,19 @@ fn checkPortType(comptime name: []const u8, comptime T: type, comptime pt: PortT
     }
 }
 
+/// Runtime form of the checks in `checkPortType`, for port types that arrive as data (an
+/// external signal) rather than as compile-time declarations.
+pub fn isValidPortType(pt: PortType) bool {
+    return switch (pt.shape) {
+        .scalar => pt.quantity == .scalar and pt.frame == .none,
+        .vec3 => pt.frame != .none and pt.quantity != .quaternion and
+            pt.quantity != .wrench and
+            (quantityDim(pt.quantity) == null or quantityDim(pt.quantity).?.eql(pt.dim)),
+        .quat => pt.frame != .none and pt.quantity == .quaternion,
+        .wrench => pt.frame != .none and pt.quantity == .wrench,
+    };
+}
+
 fn readShape(comptime T: type, values: []const f64) T {
     if (T == f64) return values[0];
     if (T == base.Vec3) return .{ .x = values[0], .y = values[1], .z = values[2] };
@@ -457,8 +476,9 @@ pub fn outputsFlat(
     x: []const f64,
     u: []const f64,
     y: []f64,
+    ctx: Context,
 ) Validity {
-    const r = model.outputs(fromSlice(M.State, x), fromSlice(M.In, u));
+    const r = model.outputs(fromSlice(M.State, x), fromSlice(M.In, u), ctx);
     toSlice(M.Out, r.value, y);
     return r.validity;
 }
@@ -470,12 +490,13 @@ pub fn derivativesFlat(
     x: []const f64,
     u: []const f64,
     dx: []f64,
+    ctx: Context,
 ) Validity {
     if (comptime M.signature.states.len == 0) {
         assert(dx.len == 0);
         return .valid;
     } else {
-        const r = model.derivatives(fromSlice(M.State, x), fromSlice(M.In, u));
+        const r = model.derivatives(fromSlice(M.State, x), fromSlice(M.In, u), ctx);
         toSlice(M.State, r.value, dx);
         return r.validity;
     }
@@ -502,9 +523,11 @@ fn sameBits(a: []const f64, b: []const f64) bool {
 /// Checks, over `samples` random points that deliberately include out-of-range values:
 ///   * outputs and derivatives are finite for any finite input (the optimizer may probe
 ///     anywhere, so a model must degrade to a flagged result, never to NaN);
-///   * evaluation is deterministic, bit for bit;
+///   * evaluation is deterministic, bit for bit, for the same context;
 ///   * for kinds declared `feedthrough = false`, outputs ignore the inputs entirely
 ///     (verified by replacing the inputs with NaN).
+/// The context is varied between samples so a kind that reads its placement is exercised,
+/// but no equality across contexts is assumed: placement is legitimate per-instance data.
 pub fn expectKindContract(
     comptime M: type,
     model: *const M,
@@ -520,29 +543,48 @@ pub fn expectKindContract(
     var u: [limits.max_slots]f64 = undefined;
     var y1: [limits.max_slots]f64 = undefined;
     var y2: [limits.max_slots]f64 = undefined;
+    var y3: [limits.max_slots]f64 = undefined;
     var dx1: [limits.max_slots]f64 = undefined;
     var dx2: [limits.max_slots]f64 = undefined;
 
     for (0..samples) |_| {
         randomFill(x[0..ns], rng);
         randomFill(u[0..ni], rng);
+        const ctx: Context = .{ .placement = .{
+            .position = .{
+                .x = rng.range(-5.0, 5.0),
+                .y = rng.range(-5.0, 5.0),
+                .z = rng.range(-5.0, 5.0),
+            },
+            .orientation = base.Quat.fromEuler(
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+                rng.range(-3.0, 3.0),
+            ),
+        } };
 
-        const v1 = outputsFlat(M, model, x[0..ns], u[0..ni], y1[0..no]);
-        const v2 = outputsFlat(M, model, x[0..ns], u[0..ni], y2[0..no]);
+        const v1 = outputsFlat(M, model, x[0..ns], u[0..ni], y1[0..no], ctx);
+        const v2 = outputsFlat(M, model, x[0..ns], u[0..ni], y2[0..no], ctx);
         for (y1[0..no]) |value| try std.testing.expect(std.math.isFinite(value));
         try std.testing.expectEqual(v1, v2);
         try std.testing.expect(sameBits(y1[0..no], y2[0..no]));
 
+        // A different placement must still produce a finite, deterministic result.
+        const ctx2: Context = .{ .placement = .{} };
+        const v3 = outputsFlat(M, model, x[0..ns], u[0..ni], y3[0..no], ctx2);
+        _ = v3;
+        for (y3[0..no]) |value| try std.testing.expect(std.math.isFinite(value));
+
         if (!sig.feedthrough) {
             @memset(u[0..ni], std.math.nan(f64));
-            _ = outputsFlat(M, model, x[0..ns], u[0..ni], y2[0..no]);
+            _ = outputsFlat(M, model, x[0..ns], u[0..ni], y2[0..no], ctx);
             try std.testing.expect(sameBits(y1[0..no], y2[0..no]));
             randomFill(u[0..ni], rng);
         }
 
         if (ns > 0) {
-            const d1 = derivativesFlat(M, model, x[0..ns], u[0..ni], dx1[0..ns]);
-            const d2 = derivativesFlat(M, model, x[0..ns], u[0..ni], dx2[0..ns]);
+            const d1 = derivativesFlat(M, model, x[0..ns], u[0..ni], dx1[0..ns], ctx);
+            const d2 = derivativesFlat(M, model, x[0..ns], u[0..ni], dx2[0..ns], ctx);
             for (dx1[0..ns]) |value| try std.testing.expect(std.math.isFinite(value));
             try std.testing.expectEqual(d1, d2);
             try std.testing.expect(sameBits(dx1[0..ns], dx2[0..ns]));
@@ -569,13 +611,15 @@ const toy = struct {
             };
         }
 
-        pub fn outputs(self: *const Model, x: State, u: In) Evaluated(Out) {
+        pub fn outputs(self: *const Model, x: State, u: In, ctx: Context) Evaluated(Out) {
             _ = self;
             _ = u;
+            _ = ctx;
             return .{ .value = .{ .position = x.position } };
         }
 
-        pub fn derivatives(self: *const Model, x: State, u: In) Evaluated(State) {
+        pub fn derivatives(self: *const Model, x: State, u: In, ctx: Context) Evaluated(State) {
+            _ = ctx;
             return switch (self.*) {
                 inline else => |*m| .{ .value = .{
                     .position = x.velocity,
@@ -618,9 +662,10 @@ const toy_wide = struct {
             return null;
         }
 
-        pub fn outputs(self: *const Model, x: State, u: In) Evaluated(Out) {
+        pub fn outputs(self: *const Model, x: State, u: In, ctx: Context) Evaluated(Out) {
             _ = self;
             _ = x;
+            _ = ctx;
             assertFiniteFields(u);
             return .{ .value = .{ .effort = .{
                 .force = u.v,
@@ -680,7 +725,7 @@ test "wide ports carry slots and round-trip through flat slices" {
     var y: [6]f64 = undefined;
     try std.testing.expectEqual(
         Validity.valid,
-        outputsFlat(Model, &m, &.{}, &u, &y),
+        outputsFlat(Model, &m, &.{}, &u, &y, .{}),
     );
     const out = fromSlice(Model.Out, &y);
     try std.testing.expectEqual(@as(f64, 1.0), out.effort.force.x);
@@ -717,8 +762,12 @@ test "flat marshalling round-trips and matches the typed call" {
     const x = [_]f64{ 0.5, -1.0 };
     const u = [_]f64{ 10.0, 0.25 };
     var dx: [2]f64 = undefined;
-    _ = derivativesFlat(toy.Model, &m, &x, &u, &dx);
-    const typed = m.derivatives(fromSlice(toy.Model.State, &x), fromSlice(toy.Model.In, &u));
+    _ = derivativesFlat(toy.Model, &m, &x, &u, &dx, .{});
+    const typed = m.derivatives(
+        fromSlice(toy.Model.State, &x),
+        fromSlice(toy.Model.In, &u),
+        .{},
+    );
     try std.testing.expectEqual(typed.value.position, dx[0]);
     try std.testing.expectEqual(typed.value.velocity, dx[1]);
     // (10 - 4 * (0.5 - 0.25)) / 2 = 4.5

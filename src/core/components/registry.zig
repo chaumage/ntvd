@@ -15,15 +15,21 @@ const base = @import("base");
 const contract = @import("contract.zig");
 
 pub const air = @import("air.zig");
+pub const body = @import("body.zig");
+pub const frame_transform = @import("frame_transform.zig");
 pub const gain = @import("gain.zig");
 pub const lift_surface = @import("lift_surface.zig");
+pub const load = @import("load.zig");
 pub const point_mass = @import("point_mass.zig");
 pub const thruster = @import("thruster.zig");
 
 pub const Component = union(enum) {
     air: air.Model,
+    body: body.Model,
+    frame_transform: frame_transform.Model,
     gain: gain.Model,
     lift_surface: lift_surface.Model,
+    load: load.Model,
     point_mass: point_mass.Model,
     thruster: thruster.Model,
 
@@ -40,9 +46,15 @@ pub const Component = union(enum) {
         };
     }
 
-    pub fn outputs(self: *const Component, x: []const f64, u: []const f64, y: []f64) base.Validity {
+    pub fn outputs(
+        self: *const Component,
+        x: []const f64,
+        u: []const f64,
+        y: []f64,
+        ctx: contract.Context,
+    ) base.Validity {
         return switch (self.*) {
-            inline else => |*m| contract.outputsFlat(@TypeOf(m.*), m, x, u, y),
+            inline else => |*m| contract.outputsFlat(@TypeOf(m.*), m, x, u, y, ctx),
         };
     }
 
@@ -51,9 +63,10 @@ pub const Component = union(enum) {
         x: []const f64,
         u: []const f64,
         dx: []f64,
+        ctx: contract.Context,
     ) base.Validity {
         return switch (self.*) {
-            inline else => |*m| contract.derivativesFlat(@TypeOf(m.*), m, x, u, dx),
+            inline else => |*m| contract.derivativesFlat(@TypeOf(m.*), m, x, u, dx, ctx),
         };
     }
 
@@ -105,8 +118,8 @@ test "flat evaluation through the union matches the typed model" {
     } };
     const c: Component = .{ .thruster = model };
     var y: [1]f64 = undefined;
-    const v = c.outputs(&.{}, &.{ 12.0, 0.5 }, &y);
-    const typed = model.outputs(.{}, .{ .airspeed = 12.0, .throttle = 0.5 });
+    const v = c.outputs(&.{}, &.{ 12.0, 0.5 }, &y, .{});
+    const typed = model.outputs(.{}, .{ .airspeed = 12.0, .throttle = 0.5 }, .{});
     try std.testing.expectEqual(typed.value.thrust, y[0]);
     try std.testing.expectEqual(typed.validity, v);
 }
@@ -114,13 +127,13 @@ test "flat evaluation through the union matches the typed model" {
 test "stateless kinds have nothing to differentiate" {
     const c: Component = .{ .gain = .{ .linear = .{ .k = 2.0 } } };
     var none: [0]f64 = .{};
-    try std.testing.expectEqual(base.Validity.valid, c.derivatives(&.{}, &.{1.0}, &none));
+    try std.testing.expectEqual(base.Validity.valid, c.derivatives(&.{}, &.{1.0}, &none, .{}));
 }
 
 test "a dynamic kind exposes derivatives through the union" {
     const c: Component = .{ .point_mass = .{ .rigid = .{ .mass_kg = 4.0 } } };
     var dx: [2]f64 = undefined;
-    _ = c.derivatives(&.{ 2.0, 0.0 }, &.{8.0}, &dx);
+    _ = c.derivatives(&.{ 2.0, 0.0 }, &.{8.0}, &dx, .{});
     try std.testing.expectEqual(@as(f64, 2.0), dx[0]);
     try std.testing.expectEqual(@as(f64, 2.0), dx[1]);
 }

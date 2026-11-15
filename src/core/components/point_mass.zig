@@ -46,15 +46,25 @@ pub const Model = union(enum) {
         };
     }
 
-    pub fn outputs(self: *const Model, x: State, u: In) contract.Evaluated(Out) {
+    pub fn outputs(
+        self: *const Model,
+        x: State,
+        u: In,
+        ctx: contract.Context,
+    ) contract.Evaluated(Out) {
         return switch (self.*) {
-            inline else => |*m| m.outputs(x, u),
+            inline else => |*m| m.outputs(x, u, ctx),
         };
     }
 
-    pub fn derivatives(self: *const Model, x: State, u: In) contract.Evaluated(State) {
+    pub fn derivatives(
+        self: *const Model,
+        x: State,
+        u: In,
+        ctx: contract.Context,
+    ) contract.Evaluated(State) {
         return switch (self.*) {
-            inline else => |*m| m.derivatives(x, u),
+            inline else => |*m| m.derivatives(x, u, ctx),
         };
     }
 };
@@ -68,9 +78,15 @@ pub const Rigid = struct {
     }
 
     /// Does not read the input: this is what `feedthrough = false` promises.
-    pub fn outputs(self: *const Rigid, x: Model.State, u: Model.In) contract.Evaluated(Model.Out) {
+    pub fn outputs(
+        self: *const Rigid,
+        x: Model.State,
+        u: Model.In,
+        ctx: contract.Context,
+    ) contract.Evaluated(Model.Out) {
         _ = self;
         _ = u;
+        _ = ctx;
         return .{ .value = .{ .velocity = x.velocity, .position = x.position } };
     }
 
@@ -78,7 +94,9 @@ pub const Rigid = struct {
         self: *const Rigid,
         x: Model.State,
         u: Model.In,
+        ctx: contract.Context,
     ) contract.Evaluated(Model.State) {
+        _ = ctx;
         contract.assertFiniteFields(x);
         contract.assertFiniteFields(u);
         assert(self.mass_kg > 0.0);
@@ -91,7 +109,7 @@ pub const Rigid = struct {
 
 test "newton's second law" {
     const m: Model = .{ .rigid = .{ .mass_kg = 10.0 } };
-    const r = m.derivatives(.{ .velocity = 3.0, .position = 7.0 }, .{ .force = 25.0 });
+    const r = m.derivatives(.{ .velocity = 3.0, .position = 7.0 }, .{ .force = 25.0 }, .{});
     try std.testing.expectEqual(@as(f64, 2.5), r.value.velocity);
     try std.testing.expectEqual(@as(f64, 3.0), r.value.position);
     try std.testing.expectEqual(base.Validity.valid, r.validity);
@@ -99,7 +117,11 @@ test "newton's second law" {
 
 test "outputs are the states and ignore the input" {
     const m: Model = .{ .rigid = .{ .mass_kg = 10.0 } };
-    const r = m.outputs(.{ .velocity = 3.0, .position = 7.0 }, .{ .force = std.math.nan(f64) });
+    const r = m.outputs(
+        .{ .velocity = 3.0, .position = 7.0 },
+        .{ .force = std.math.nan(f64) },
+        .{},
+    );
     try std.testing.expectEqual(@as(f64, 3.0), r.value.velocity);
     try std.testing.expectEqual(@as(f64, 7.0), r.value.position);
 }

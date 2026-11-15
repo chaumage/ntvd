@@ -69,7 +69,7 @@ pub fn rk4Step(
     ws: *Workspace,
 ) StepError!Validity {
     const n: usize = plan.n_states;
-    assert(x.len == n and externals.len == plan.n_externals);
+    assert(x.len == n and externals.len == plan.n_external_slots);
     assert(ws.model.signals.len == plan.n_signals);
     assert(ws.scratch.len == 5 * n);
     if (!(dt > 0.0) or !std.math.isFinite(dt)) return error.Diverged;

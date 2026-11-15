@@ -188,7 +188,7 @@ fn checkPlan(plan: *const model.Plan, rng: *Rng) !void {
         if (!sig.feedthrough) continue;
         for (node.inputs[0..sig.inputs.len]) |wiring| {
             for (plan.links[wiring.first..][0..wiring.count]) |link| {
-                if (link.source < plan.n_externals) continue;
+                if (link.source < plan.n_external_slots) continue;
                 const producer = producerOf(plan, link.source);
                 try std.testing.expect(position[producer] < position[ni]);
             }
@@ -209,7 +209,7 @@ fn checkPlan(plan: *const model.Plan, rng: *Rng) !void {
     defer allocator.free(x);
     const dx = try allocator.alloc(f64, plan.n_states);
     defer allocator.free(dx);
-    const ext = try allocator.alloc(f64, plan.n_externals);
+    const ext = try allocator.alloc(f64, plan.n_external_slots);
     defer allocator.free(ext);
 
     const inf = std.math.inf(f64);
@@ -222,7 +222,7 @@ fn checkPlan(plan: *const model.Plan, rng: *Rng) !void {
             v.* = if (round < 2) rng.range(-50.0, 50.0) else pick(&specials, rng, round);
         }
         _ = plan.rhs(x, ext, ws, dx);
-        for (ws.signals[plan.n_externals..plan.n_signals]) |v| {
+        for (ws.signals[plan.n_external_slots..plan.n_signals]) |v| {
             try std.testing.expect(std.math.isFinite(v));
         }
         for (dx) |v| try std.testing.expect(std.math.isFinite(v));
@@ -236,7 +236,7 @@ fn pick(values: []const f64, rng: *Rng, round: usize) f64 {
 }
 
 fn producerOf(plan: *const model.Plan, signal: u16) u32 {
-    const offset = signal - plan.n_externals;
+    const offset = signal - plan.n_external_slots;
     for (plan.nodes[0..plan.n_nodes], 0..) |*node, ni| {
         const end = node.out_offset + @as(u16, node.n_out);
         if (offset >= node.out_offset and offset < end) return @intCast(ni);

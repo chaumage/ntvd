@@ -2,14 +2,18 @@
 //!
 //! Stages (each a small function, run in this order):
 //!   1. measure       exact layout and byte count of the plan
-//!   2. build         externals, nodes, initial states, signal and state layout
-//!   3. connections   paths resolve, dimensions agree, gains are finite
-//!   4. drivers       every `single` input has exactly one source
-//!   5. links         connections laid out per input port
-//!   6. order         feedthrough components sorted after their sources
+//!   2. externals     names and typed boundary signals
+//!   3. nodes         authored components, placements and initial states
+//!   4. connections   paths resolve, types agree; rigid attachments and cross-frame vectors
+//!                    become generated nodes
+//!   5. drivers       every `single` input has exactly one source
+//!   6. links         connections laid out per input port
+//!   7. order         feedthrough components sorted after their sources
 //!
-//! The plan is carved from a caller-owned buffer. `bytesNeeded` and `compileInto` share
-//! `measure`, so the required size and the actual layout cannot drift.
+//! The plan is carved from a caller-owned buffer. `bytesNeeded` and `compileInto` share the
+//! same spec-only connection classifier, so the required size and the actual layout cannot
+//! drift. A connection between two different frames becomes an ordinary `frame_transform`
+//! node, which inherits evaluation, validity and ordering from the rest of the graph.
 //!
 //! Algebraic loops (feedthrough components feeding each other in a cycle) are rejected for
 //! now. The way to break one is to make a state of it (a dynamic component) or to turn the
@@ -18,7 +22,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const base = @import("base");
-const components_contract = @import("components").contract;
+const components = @import("components");
+const contract = components.contract;
+const frame_transform = components.frame_transform;
 const spec_mod = @import("spec.zig");
 const plan_mod = @import("plan.zig");
 const storage_mod = @import("storage.zig");
@@ -31,7 +37,6 @@ const Plan = plan_mod.Plan;
 const Node = plan_mod.Node;
 const Link = plan_mod.Link;
 const Name = base.Name;
-const Dim = base.Dim;
 const Sizer = storage_mod.Sizer;
 const Carver = storage_mod.Carver;
 
@@ -42,10 +47,12 @@ pub const CompileError = error{
     TooManyConnections,
     TooManyStates,
     TooManySignals,
+    TooManyGeneratedNodes,
     InvalidName,
     DuplicateName,
     InvalidParameter,
     BadInitialState,
+    BadPlacement,
     BadPath,
     UnknownComponent,
     UnknownExternal,
@@ -56,9 +63,13 @@ pub const CompileError = error{
     MultiplyDriven,
     UnconnectedInput,
     AlgebraicLoop,
+    AmbiguousBody,
+    BodyHasNoAttitude,
+    RigidAttachmentNotWrench,
+    RigidAttachmentToNonBody,
 };
 
-/// A connection with all names resolved to indices.
+/// A connection with all names resolved and its frame transform decided, if any.
 const Resolved = struct {
     to_node: u16,
     to_port: u8,
@@ -75,8 +86,8 @@ comptime {
     if (@alignOf(Name) > storage_mod.alignment) {
         @compileError("Name alignment exceeds storage");
     }
-    if (@alignOf(Dim) > storage_mod.alignment) {
-        @compileError("Dim alignment exceeds storage");
+    if (@alignOf(contract.PortType) > storage_mod.alignment) {
+        @compileError("PortType alignment exceeds storage");
     }
 }
 
@@ -84,12 +95,13 @@ comptime {
 /// check; `compileInto` rejects anything that does not fit the `u16` encoding.
 pub const Layout = struct {
     n_externals: usize,
+    n_external_slots: usize,
     n_nodes: usize,
+    n_generated: usize,
     n_links: usize,
     n_states: usize,
     n_signals: usize,
     n_attitude_states: usize,
-    n_connections: usize,
     bytes: usize,
 };
 
@@ -116,26 +128,29 @@ pub fn compileInto(
     var carver = Carver.init(storage);
     const plan = carver.takeOne(Plan);
     const external_names = carver.take(Name, layout.n_externals);
-    const external_dims = carver.take(Dim, layout.n_externals);
+    const external_ptypes = carver.take(contract.PortType, layout.n_externals);
+    const external_offsets = carver.take(u16, layout.n_externals);
     const nodes = carver.take(Node, layout.n_nodes);
     const order = carver.take(u16, layout.n_nodes);
     const links = carver.take(Link, layout.n_links);
     const initial_state = carver.take(f64, layout.n_states);
     const attitude_states = carver.take(u16, layout.n_attitude_states);
-    const resolved = carver.take(Resolved, layout.n_connections);
+    const resolved = carver.take(Resolved, layout.n_links);
     const waiting = carver.take(u16, layout.n_nodes);
     const placed = carver.take(bool, layout.n_nodes);
     assert(carver.cursor == layout.bytes);
 
     plan.* = .{
         .external_names = external_names,
-        .external_dims = external_dims,
+        .external_ptypes = external_ptypes,
+        .external_offsets = external_offsets,
         .nodes = nodes,
         .order = order,
         .links = links,
         .initial_state = initial_state,
         .attitude_states = attitude_states,
         .n_externals = @intCast(layout.n_externals),
+        .n_external_slots = @intCast(layout.n_external_slots),
         .n_nodes = @intCast(layout.n_nodes),
         .n_links = @intCast(layout.n_links),
         .n_states = @intCast(layout.n_states),
@@ -143,53 +158,84 @@ pub fn compileInto(
     };
 
     try buildExternals(spec, plan, diag);
-    try buildNodes(spec, plan, initial_state, diag);
-    const n = try resolveConnections(spec, plan, resolved, diag);
+    try buildNodes(spec, plan, initial_state, attitude_states, diag);
+    const body = try findBody(spec, diag);
+    try checkRigidAttachments(spec, diag);
+    const n = try buildResolved(spec, plan, body, resolved, diag);
+    assert(n == plan.n_links);
     try checkDrivers(plan, resolved[0..n], diag);
     layoutLinks(plan, resolved[0..n]);
     try orderNodes(plan, resolved[0..n], waiting, placed, diag);
     return plan;
 }
 
+const Count = struct { nodes: usize, links: usize };
+
 /// Counts and byte size only. Never fails: an invalid spec still has a computable footprint.
+/// A connection that cannot be classified is charged the largest transform footprint, so the
+/// estimate is never below what `compileInto` would need.
 fn measure(spec: *const Spec) Layout {
     var n_states: usize = 0;
     var n_outputs: usize = 0;
+    var n_attitude_states: usize = 0;
     for (spec.components) |cs| {
         const sig = cs.component.signature();
         n_states += @as(usize, sig.stateSlots());
         n_outputs += @as(usize, sig.outputSlots());
-        // Phase 2b derives attitude slots from `quantity = .quaternion`; none yet.
+        for (sig.states) |p| {
+            if (p.ptype.quantity == .quaternion) n_attitude_states += 1;
+        }
     }
-    const n_externals = spec.externals.len;
-    const n_nodes = spec.components.len;
-    const n_links = spec.connections.len;
-    const n_signals = n_externals + n_outputs;
-    const n_connections = spec.connections.len;
+    var n_external_slots: usize = 0;
+    for (spec.externals) |ext| n_external_slots += @as(usize, externalType(ext).width());
+
+    const body = findBodyLenient(spec);
+    var n_generated: usize = 0;
+    var n_links: usize = 0;
+    for (spec.connections) |c| {
+        const count = countOne(spec, c, body) orelse Count{ .nodes = 1, .links = 3 };
+        n_generated += count.nodes;
+        n_links += count.links;
+    }
+    const ft = frame_transform.Model.signature;
+    const generated_outputs = n_generated * @as(usize, ft.outputSlots());
+    const n_nodes = spec.components.len + n_generated;
+    const n_signals = n_external_slots + n_outputs + generated_outputs;
 
     var sizer: Sizer = .{};
     sizer.add(Plan, 1);
-    sizer.add(Name, n_externals);
-    sizer.add(Dim, n_externals);
+    sizer.add(Name, spec.externals.len);
+    sizer.add(contract.PortType, spec.externals.len);
+    sizer.add(u16, spec.externals.len);
     sizer.add(Node, n_nodes);
     sizer.add(u16, n_nodes);
     sizer.add(Link, n_links);
     sizer.add(f64, n_states);
-    sizer.add(u16, 0);
-    sizer.add(Resolved, n_connections);
+    sizer.add(u16, n_attitude_states);
+    sizer.add(Resolved, n_links);
     sizer.add(u16, n_nodes);
     sizer.add(bool, n_nodes);
 
     return .{
-        .n_externals = n_externals,
+        .n_externals = spec.externals.len,
+        .n_external_slots = n_external_slots,
         .n_nodes = n_nodes,
+        .n_generated = n_generated,
         .n_links = n_links,
         .n_states = n_states,
         .n_signals = n_signals,
-        .n_attitude_states = 0,
-        .n_connections = n_connections,
+        .n_attitude_states = n_attitude_states,
         .bytes = sizer.bytes(),
     };
+}
+
+fn countOne(spec: *const Spec, c: spec_mod.ConnectionSpec, body: ?Body) ?Count {
+    var diag: Diagnostic = .{};
+    const cl = classifyOne(spec, c, body, &diag) catch return null;
+    if (cl.transform) |t| {
+        return .{ .nodes = 1, .links = if (t.needs_attitude) 3 else 2 };
+    }
+    return .{ .nodes = 0, .links = 1 };
 }
 
 fn checkCounts(layout: Layout, diag: *Diagnostic) CompileError!void {
@@ -200,15 +246,27 @@ fn checkCounts(layout: Layout, diag: *Diagnostic) CompileError!void {
         });
         return error.TooManyExternals;
     }
+    if (layout.n_external_slots > ceiling) {
+        diag.set("{d} external slots exceed the u16 encoding limit of {d}", .{
+            layout.n_external_slots, ceiling,
+        });
+        return error.TooManyExternals;
+    }
     if (layout.n_nodes > ceiling) {
         diag.set("{d} components exceed the u16 encoding limit of {d}", .{
             layout.n_nodes, ceiling,
         });
         return error.TooManyComponents;
     }
-    if (layout.n_links > ceiling or layout.n_connections > ceiling) {
-        diag.set("{d} connections exceed the u16 encoding limit of {d}", .{
-            layout.n_connections, ceiling,
+    if (layout.n_generated > ceiling) {
+        diag.set("{d} generated nodes exceed the u16 encoding limit of {d}", .{
+            layout.n_generated, ceiling,
+        });
+        return error.TooManyGeneratedNodes;
+    }
+    if (layout.n_links > ceiling) {
+        diag.set("{d} links exceed the u16 encoding limit of {d}", .{
+            layout.n_links, ceiling,
         });
         return error.TooManyConnections;
     }
@@ -227,29 +285,47 @@ fn checkCounts(layout: Layout, diag: *Diagnostic) CompileError!void {
 }
 
 fn makeName(text: []const u8, what: []const u8, diag: *Diagnostic) CompileError!base.Name {
+    if (std.mem.startsWith(u8, text, "__x_")) {
+        diag.set("invalid {s} name '{s}': the '__x_' prefix is reserved", .{ what, text });
+        return error.InvalidName;
+    }
     return base.Name.init(text) catch |err| {
         diag.set("invalid {s} name '{s}': {s}", .{ what, text, @errorName(err) });
         return error.InvalidName;
     };
 }
 
+fn externalType(ext: spec_mod.ExternalSpec) contract.PortType {
+    return .{ .dim = ext.dim, .shape = ext.shape, .quantity = ext.quantity, .frame = ext.frame };
+}
+
 fn buildExternals(spec: *const Spec, plan: *Plan, diag: *Diagnostic) CompileError!void {
+    var slot: u16 = 0;
     for (spec.externals, 0..) |ext, i| {
         plan.external_names[i] = try makeName(ext.name, "external", diag);
-        plan.external_dims[i] = ext.dim;
         for (spec.externals[0..i]) |other| {
             if (std.mem.eql(u8, other.name, ext.name)) {
                 diag.set("external '{s}' is declared twice", .{ext.name});
                 return error.DuplicateName;
             }
         }
+        const pt = externalType(ext);
+        if (!contract.isValidPortType(pt)) {
+            diag.set("external '{s}' has an invalid shape, quantity or frame", .{ext.name});
+            return error.FrameMismatch;
+        }
+        plan.external_ptypes[i] = pt;
+        plan.external_offsets[i] = slot;
+        slot += pt.width();
     }
+    assert(slot == plan.n_external_slots);
 }
 
 fn buildNodes(
     spec: *const Spec,
     plan: *Plan,
     initial_state: []f64,
+    attitude_states: []u16,
     diag: *Diagnostic,
 ) CompileError!void {
     var state_cursor: u16 = 0;
@@ -268,6 +344,10 @@ fn buildNodes(
             });
             return error.InvalidParameter;
         }
+        const placement = resolvePlacement(cs.placement) orelse {
+            diag.set("component '{s}' has a non-finite placement", .{cs.name});
+            return error.BadPlacement;
+        };
 
         const sig = cs.component.signature();
         const node = &plan.nodes[i];
@@ -276,6 +356,7 @@ fn buildNodes(
         const state_slots = sig.stateSlots();
         node.name = name;
         node.component = cs.component;
+        node.placement = placement;
         node.n_in = @intCast(in_slots);
         node.n_out = @intCast(out_slots);
         node.n_state = @intCast(state_slots);
@@ -283,24 +364,38 @@ fn buildNodes(
         node.out_offset = out_cursor;
         node.inputs = @splat(.{});
 
-        try copyInitialState(cs, initial_state, state_cursor, diag);
+        try copyInitialState(cs, sig, initial_state, state_cursor, diag);
         state_cursor += state_slots;
         out_cursor += out_slots;
     }
     assert(state_cursor == plan.n_states);
-    assert(plan.n_externals + out_cursor == plan.n_signals);
+    fillAttitudeStates(plan, spec.components.len, attitude_states);
+}
+
+fn fillAttitudeStates(plan: *const Plan, n_authored: usize, out: []u16) void {
+    var cursor: usize = 0;
+    for (plan.nodes[0..n_authored]) |*node| {
+        const sig = node.component.signature();
+        for (sig.states, 0..) |p, si| {
+            if (p.ptype.quantity != .quaternion) continue;
+            out[cursor] = node.state_offset + contract.slotsBefore(sig.states, @intCast(si));
+            cursor += 1;
+        }
+    }
+    assert(cursor == out.len);
 }
 
 fn copyInitialState(
     cs: spec_mod.ComponentSpec,
+    sig: *const contract.Signature,
     state: []f64,
     offset: u16,
     diag: *Diagnostic,
 ) CompileError!void {
-    const n: usize = cs.component.signature().stateSlots();
+    const n: usize = sig.stateSlots();
     const dest = state[offset..][0..n];
     if (cs.initial_state.len == 0) {
-        @memset(dest, 0.0);
+        fillStateDefaults(sig, dest);
         return;
     }
     if (cs.initial_state.len != n) {
@@ -316,94 +411,354 @@ fn copyInitialState(
         }
     }
     @memcpy(dest, cs.initial_state);
+    try normalizeQuaternions(cs.name, sig, dest, diag);
 }
 
-fn resolveConnections(
-    spec: *const Spec,
-    plan: *const Plan,
-    out: []Resolved,
-    diag: *Diagnostic,
-) CompileError!u32 {
-    assert(out.len == spec.connections.len);
-    for (spec.connections, 0..) |c, i| {
-        out[i] = try resolveOne(c, plan, diag);
+fn fillStateDefaults(sig: *const contract.Signature, dest: []f64) void {
+    var cursor: usize = 0;
+    for (sig.states) |p| {
+        const width: usize = p.ptype.width();
+        @memset(dest[cursor..][0..width], 0.0);
+        // A quaternion defaults to the identity rotation, (w, x, y, z) = (1, 0, 0, 0).
+        if (p.ptype.quantity == .quaternion) dest[cursor] = 1.0;
+        cursor += width;
     }
-    return @intCast(spec.connections.len);
 }
 
-const Endpoint = struct {
-    signal_or_port: u16,
-    node: ?u16,
-    ptype: components_contract.PortType,
+fn normalizeQuaternions(
+    name: []const u8,
+    sig: *const contract.Signature,
+    dest: []f64,
+    diag: *Diagnostic,
+) CompileError!void {
+    var cursor: usize = 0;
+    for (sig.states) |p| {
+        const width: usize = p.ptype.width();
+        if (p.ptype.quantity == .quaternion) {
+            const q: base.Quat = .{
+                .w = dest[cursor],
+                .x = dest[cursor + 1],
+                .y = dest[cursor + 2],
+                .z = dest[cursor + 3],
+            };
+            const unit = base.Quat.normalized(q) orelse {
+                diag.set("component '{s}' has a zero or non-finite initial '{s}'", .{
+                    name, p.name,
+                });
+                return error.BadInitialState;
+            };
+            dest[cursor] = unit.w;
+            dest[cursor + 1] = unit.x;
+            dest[cursor + 2] = unit.y;
+            dest[cursor + 3] = unit.z;
+        }
+        cursor += width;
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Frame resolution: the same classifier backs `measure` and `compileInto`.
+// ---------------------------------------------------------------------------------------
+
+const FrameRef = union(enum) {
+    none,
+    world,
+    body,
+    local: u16,
 };
 
-fn resolveOne(
+const SpecEndpoint = struct {
+    /// Owning component, null for an external signal.
+    node: ?u16,
+    /// Output port index, input port index, or external index when `node` is null.
+    index: u16,
+    ptype: contract.PortType,
+    frame: FrameRef,
+};
+
+const Transform = struct {
+    apply: frame_transform.Apply,
+    /// True when the transform reads the body attitude through its `q` input.
+    needs_attitude: bool,
+};
+
+const Classified = struct {
+    from: SpecEndpoint,
+    to: SpecEndpoint,
+    gain: f64,
+    transform: ?Transform,
+};
+
+const Body = struct {
+    node: u16,
+    /// Index of the body's wrench summing input `mount`.
+    mount_port: u8,
+    attitude_port: ?u32,
+};
+
+fn classifyOne(
+    spec: *const Spec,
     c: spec_mod.ConnectionSpec,
-    plan: *const Plan,
+    body: ?Body,
     diag: *Diagnostic,
-) CompileError!Resolved {
+) CompileError!Classified {
     if (!std.math.isFinite(c.gain)) {
         diag.set("connection {s} -> {s} has a non-finite gain", .{ c.from, c.to });
         return error.InvalidGain;
     }
-    const from = try resolveSource(c.from, plan, diag);
-    const to = try resolveTarget(c.to, plan, diag);
-    if (components_contract.compatibility(from.ptype, to.ptype)) |reason| {
-        if (reason == .dimension) {
-            diag.set("{s} [{f}] cannot drive {s} [{f}]", .{
-                c.from, from.ptype.dim, c.to, to.ptype.dim,
-            });
-            return error.DimensionMismatch;
-        }
-        diag.set("{s} cannot drive {s}: incompatible {s}", .{
-            c.from, c.to, @tagName(reason),
+    if (c.attachment == .rigid) return classifyRigid(spec, c, body, diag);
+    const from = try specSource(spec, c.from, diag);
+    const to = try specTarget(spec, c.to, diag);
+    try checkTypes(c, from, to, diag);
+    const transform = try frameTransform(spec, from, to, body, diag);
+    return .{ .from = from, .to = to, .gain = c.gain, .transform = transform };
+}
+
+/// A rigid attachment is one wire: a component's local wrench output to the designated
+/// body's `mount` input. It becomes a single `mount` node, placed at the source.
+fn classifyRigid(
+    spec: *const Spec,
+    c: spec_mod.ConnectionSpec,
+    body: ?Body,
+    diag: *Diagnostic,
+) CompileError!Classified {
+    const from = try specSource(spec, c.from, diag);
+    const to = try specTarget(spec, c.to, diag);
+    const source_node = from.node orelse {
+        diag.set("rigid attachment {s} -> {s} needs a component's wrench output", .{
+            c.from, c.to,
+        });
+        return error.RigidAttachmentNotWrench;
+    };
+    if (from.ptype.shape != .wrench) {
+        diag.set("rigid attachment {s} -> {s} needs a wrench output", .{ c.from, c.to });
+        return error.RigidAttachmentNotWrench;
+    }
+    if (from.ptype.frame != .local) {
+        diag.set("rigid attachment {s} -> {s} needs a local-frame wrench output", .{
+            c.from, c.to,
         });
         return error.FrameMismatch;
     }
+    const b = body orelse {
+        diag.set("rigid attachment {s} -> {s} needs exactly one body", .{ c.from, c.to });
+        return error.AmbiguousBody;
+    };
+    if (to.node != b.node or to.index != b.mount_port) {
+        diag.set("rigid attachment {s} -> {s} must target the body's mount input", .{
+            c.from, c.to,
+        });
+        return error.RigidAttachmentToNonBody;
+    }
+    const placement = try placementOf(spec, source_node, diag);
     return .{
-        .to_node = to.node.?,
-        .to_port = @intCast(to.signal_or_port),
-        .source = from.signal_or_port,
-        .from_node = from.node,
+        .from = from,
+        .to = to,
         .gain = c.gain,
+        .transform = .{
+            .apply = .{
+                .mode = .mount,
+                .pre = placement.orientation,
+                .dynamic = .none,
+                .r = placement.position,
+            },
+            .needs_attitude = false,
+        },
     };
 }
 
-fn resolveSource(text: []const u8, plan: *const Plan, diag: *Diagnostic) CompileError!Endpoint {
+fn checkTypes(
+    c: spec_mod.ConnectionSpec,
+    from: SpecEndpoint,
+    to: SpecEndpoint,
+    diag: *Diagnostic,
+) CompileError!void {
+    if (from.ptype.shape != to.ptype.shape) {
+        diag.set("{s} cannot drive {s}: incompatible shape", .{ c.from, c.to });
+        return error.FrameMismatch;
+    }
+    if (from.ptype.quantity != to.ptype.quantity) {
+        diag.set("{s} cannot drive {s}: incompatible quantity", .{ c.from, c.to });
+        return error.FrameMismatch;
+    }
+    if (from.ptype.shape != .wrench and !from.ptype.dim.eql(to.ptype.dim)) {
+        diag.set("{s} [{f}] cannot drive {s} [{f}]", .{
+            c.from, from.ptype.dim, c.to, to.ptype.dim,
+        });
+        return error.DimensionMismatch;
+    }
+}
+
+fn frameTransform(
+    spec: *const Spec,
+    from: SpecEndpoint,
+    to: SpecEndpoint,
+    body: ?Body,
+    diag: *Diagnostic,
+) CompileError!?Transform {
+    if (sameFrame(from.frame, to.frame)) return null;
+    if (isNone(from.frame) or isNone(to.frame)) {
+        diag.set("a scalar signal has no frame and cannot cross a frame boundary", .{});
+        return error.FrameMismatch;
+    }
+    switch (from.ptype.shape) {
+        .scalar => {
+            diag.set("a scalar signal has no frame and cannot cross a frame boundary", .{});
+            return error.FrameMismatch;
+        },
+        .quat => {
+            diag.set("quaternion frame transforms need the body rate; not available yet", .{});
+            return error.FrameMismatch;
+        },
+        .wrench => {
+            diag.set("a wrench may only be driven by a rigid attachment", .{});
+            return error.FrameMismatch;
+        },
+        .vec3 => {},
+    }
+    if (from.ptype.quantity == .position) {
+        diag.set("position transforms need the body position state; not available yet", .{});
+        return error.FrameMismatch;
+    }
+
+    var pre = base.Quat.identity;
+    var post = base.Quat.identity;
+    if (localNode(to.frame)) |n| {
+        pre = base.Quat.conjugate(try orientationOf(spec, n, diag));
+    }
+    if (localNode(from.frame)) |n| post = try orientationOf(spec, n, diag);
+
+    const dynamic: frame_transform.Dynamic =
+        if (isNonWorld(from.frame) and isNonWorld(to.frame))
+            .none
+        else if (isNonWorld(from.frame))
+            .direct
+        else if (isNonWorld(to.frame))
+            .conjugate
+        else
+            .none;
+    if (dynamic != .none) {
+        const b = body orelse {
+            diag.set("a world-frame transform needs exactly one body component", .{});
+            return error.AmbiguousBody;
+        };
+        if (b.attitude_port == null) {
+            diag.set("the body has no 'attitude' output for world-frame transforms", .{});
+            return error.BodyHasNoAttitude;
+        }
+    }
+    return .{
+        .apply = .{
+            .mode = .rotate,
+            .pre = pre,
+            .post = post,
+            .dynamic = dynamic,
+        },
+        .needs_attitude = dynamic != .none,
+    };
+}
+
+fn sameFrame(a: FrameRef, b: FrameRef) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .none, .world, .body => true,
+        .local => |na| na == b.local,
+    };
+}
+
+fn isNone(f: FrameRef) bool {
+    return std.meta.activeTag(f) == .none;
+}
+
+fn isNonWorld(f: FrameRef) bool {
+    return switch (f) {
+        .none, .world => false,
+        .body, .local => true,
+    };
+}
+
+fn localNode(f: FrameRef) ?u16 {
+    return switch (f) {
+        .local => |n| n,
+        else => null,
+    };
+}
+
+fn resolvePlacement(p: spec_mod.Placement) ?base.Placement {
+    if (!p.position_m.isFinite() or !p.attitude_rad.isFinite()) return null;
+    return .{
+        .position = p.position_m,
+        .orientation = base.Quat.fromEuler(p.attitude_rad.x, p.attitude_rad.y, p.attitude_rad.z),
+    };
+}
+
+fn placementOf(spec: *const Spec, node: u16, diag: *Diagnostic) CompileError!base.Placement {
+    return resolvePlacement(spec.components[node].placement) orelse {
+        diag.set("component '{s}' has a non-finite placement", .{
+            spec.components[node].name,
+        });
+        return error.BadPlacement;
+    };
+}
+
+fn orientationOf(spec: *const Spec, node: u16, diag: *Diagnostic) CompileError!base.Quat {
+    return (try placementOf(spec, node, diag)).orientation;
+}
+
+fn frameOf(
+    pt: contract.PortType,
+    node: ?u16,
+    text: []const u8,
+    diag: *Diagnostic,
+) CompileError!FrameRef {
+    return switch (pt.frame) {
+        .none => .none,
+        .world => .world,
+        .body => .body,
+        .local => if (node) |n| .{ .local = n } else {
+            diag.set("'{s}' is in a local frame but has no owning component", .{text});
+            return error.FrameMismatch;
+        },
+    };
+}
+
+fn specSource(spec: *const Spec, text: []const u8, diag: *Diagnostic) CompileError!SpecEndpoint {
     const p = path.parse(text) catch {
         diag.set("malformed source path '{s}'", .{text});
         return error.BadPath;
     };
     const port = p.port orelse {
-        const ei = plan.externalIndex(p.head) orelse {
+        const ei = specExternalIndex(spec, p.head) orelse {
             diag.set("unknown external signal '{s}'", .{p.head});
             return error.UnknownExternal;
         };
+        const pt = externalType(spec.externals[ei]);
         return .{
-            .signal_or_port = ei,
             .node = null,
-            .ptype = components_contract.scalar(plan.external_dims[ei]),
+            .index = ei,
+            .ptype = pt,
+            .frame = try frameOf(pt, null, text, diag),
         };
     };
-    const ni = plan.nodeIndex(p.head) orelse {
+    const ni = specNodeIndex(spec, p.head) orelse {
         diag.set("unknown component '{s}' in '{s}'", .{ p.head, text });
         return error.UnknownComponent;
     };
-    const node = &plan.nodes[ni];
-    const sig = node.component.signature();
+    const sig = spec.components[ni].component.signature();
     const oi = sig.outputIndex(port) orelse {
         diag.set("component '{s}' has no output '{s}'", .{ p.head, port });
         return error.UnknownPort;
     };
-    const slot = components_contract.slotsBefore(sig.outputs, oi);
+    const pt = sig.outputs[oi].ptype;
     return .{
-        .signal_or_port = plan.n_externals + node.out_offset + slot,
         .node = ni,
-        .ptype = sig.outputs[oi].ptype,
+        .index = @intCast(oi),
+        .ptype = pt,
+        .frame = try frameOf(pt, ni, text, diag),
     };
 }
 
-fn resolveTarget(text: []const u8, plan: *const Plan, diag: *Diagnostic) CompileError!Endpoint {
+fn specTarget(spec: *const Spec, text: []const u8, diag: *Diagnostic) CompileError!SpecEndpoint {
     const p = path.parse(text) catch {
         diag.set("malformed target path '{s}'", .{text});
         return error.BadPath;
@@ -412,17 +767,244 @@ fn resolveTarget(text: []const u8, plan: *const Plan, diag: *Diagnostic) Compile
         diag.set("target '{s}' must be written component.input", .{text});
         return error.BadPath;
     };
-    const ni = plan.nodeIndex(p.head) orelse {
+    const ni = specNodeIndex(spec, p.head) orelse {
         diag.set("unknown component '{s}' in '{s}'", .{ p.head, text });
         return error.UnknownComponent;
     };
-    const sig = plan.nodes[ni].component.signature();
+    const sig = spec.components[ni].component.signature();
     const ii = sig.inputIndex(port) orelse {
         diag.set("component '{s}' has no input '{s}'", .{ p.head, port });
         return error.UnknownPort;
     };
-    return .{ .signal_or_port = @intCast(ii), .node = ni, .ptype = sig.inputs[ii].ptype };
+    const pt = sig.inputs[ii].ptype;
+    return .{
+        .node = ni,
+        .index = @intCast(ii),
+        .ptype = pt,
+        .frame = try frameOf(pt, ni, text, diag),
+    };
 }
+
+fn specNodeIndex(spec: *const Spec, name: []const u8) ?u16 {
+    for (spec.components, 0..) |cs, i| {
+        if (std.mem.eql(u8, cs.name, name)) return @intCast(i);
+    }
+    return null;
+}
+
+fn specExternalIndex(spec: *const Spec, name: []const u8) ?u16 {
+    for (spec.externals, 0..) |ext, i| {
+        if (std.mem.eql(u8, ext.name, name)) return @intCast(i);
+    }
+    return null;
+}
+
+fn findBody(spec: *const Spec, diag: *Diagnostic) CompileError!?Body {
+    var found: ?Body = null;
+    for (spec.components, 0..) |cs, i| {
+        const sig = cs.component.signature();
+        const mi = sig.inputIndex("mount") orelse continue;
+        if (sig.inputs[mi].ptype.shape != .wrench) continue;
+        if (found != null) {
+            diag.set("more than one component has a wrench mount input; body is ambiguous", .{});
+            return error.AmbiguousBody;
+        }
+        found = .{
+            .node = @intCast(i),
+            .mount_port = @intCast(mi),
+            .attitude_port = sig.outputIndex("attitude"),
+        };
+    }
+    return found;
+}
+
+fn findBodyLenient(spec: *const Spec) ?Body {
+    for (spec.components, 0..) |cs, i| {
+        const sig = cs.component.signature();
+        const mi = sig.inputIndex("mount") orelse continue;
+        if (sig.inputs[mi].ptype.shape != .wrench) continue;
+        return .{
+            .node = @intCast(i),
+            .mount_port = @intCast(mi),
+            .attitude_port = sig.outputIndex("attitude"),
+        };
+    }
+    return null;
+}
+
+/// A component may be rigidly attached once. `body.mount` sums, so a second wire would
+/// otherwise be silently added a second time. Reject it like any other multiply-driven input.
+fn checkRigidAttachments(spec: *const Spec, diag: *Diagnostic) CompileError!void {
+    for (spec.connections, 0..) |c, i| {
+        if (c.attachment != .rigid) continue;
+        const node = rigidSourceNode(spec, c.from) orelse continue;
+        for (spec.connections[0..i]) |earlier| {
+            if (earlier.attachment != .rigid) continue;
+            if (rigidSourceNode(spec, earlier.from) != node) continue;
+            diag.set("component '{s}' is rigidly attached more than once", .{
+                spec.components[node].name,
+            });
+            return error.MultiplyDriven;
+        }
+    }
+}
+
+fn rigidSourceNode(spec: *const Spec, text: []const u8) ?u16 {
+    const p = path.parse(text) catch return null;
+    if (p.port == null) return null;
+    return specNodeIndex(spec, p.head);
+}
+
+// ---------------------------------------------------------------------------------------
+// Resolved links, including the generated transform nodes.
+// ---------------------------------------------------------------------------------------
+
+const BuildState = struct {
+    resolved: []Resolved,
+    cursor: u16 = 0,
+    node_cursor: u16,
+    out_cursor: u16,
+    generated: u16 = 0,
+};
+
+fn buildResolved(
+    spec: *const Spec,
+    plan: *Plan,
+    body: ?Body,
+    resolved: []Resolved,
+    diag: *Diagnostic,
+) CompileError!u32 {
+    var st: BuildState = .{
+        .resolved = resolved,
+        .node_cursor = @intCast(spec.components.len),
+        .out_cursor = authoredOutputSlots(plan, spec.components.len),
+    };
+    for (spec.connections) |c| {
+        const cl = try classifyOne(spec, c, body, diag);
+        if (cl.transform) |t| {
+            try appendTransform(spec, plan, body, cl, t, &st, diag);
+        } else {
+            append(&st, .{
+                .to_node = cl.to.node.?,
+                .to_port = @intCast(cl.to.index),
+                .source = sourceSlot(plan, cl.from),
+                .from_node = cl.from.node,
+                .gain = cl.gain,
+            });
+        }
+    }
+    assert(st.node_cursor == plan.n_nodes);
+    assert(plan.n_external_slots + st.out_cursor == plan.n_signals);
+    return st.cursor;
+}
+
+fn append(st: *BuildState, r: Resolved) void {
+    st.resolved[st.cursor] = r;
+    st.cursor += 1;
+}
+
+fn authoredOutputSlots(plan: *const Plan, n_authored: usize) u16 {
+    var n: u16 = 0;
+    for (plan.nodes[0..n_authored]) |node| n = node.out_offset + node.n_out;
+    return n;
+}
+
+fn appendTransform(
+    spec: *const Spec,
+    plan: *Plan,
+    body: ?Body,
+    cl: Classified,
+    t: Transform,
+    st: *BuildState,
+    diag: *Diagnostic,
+) CompileError!void {
+    const sig = frame_transform.Model.signature;
+    const x_node = st.node_cursor;
+    const x = &plan.nodes[x_node];
+    x.* = .{
+        .name = try generatedName(st.generated, diag),
+        .component = .{ .frame_transform = .{ .apply = t.apply } },
+        .placement = .{},
+        .n_in = @intCast(sig.inputSlots()),
+        .n_out = @intCast(sig.outputSlots()),
+        .n_state = 0,
+        .state_offset = 0,
+        .out_offset = st.out_cursor,
+        .inputs = @splat(.{}),
+    };
+    const port_name = if (t.apply.mode == .rotate) "v" else "wrench";
+    append(st, .{
+        .to_node = x_node,
+        .to_port = @intCast(sig.inputIndex(port_name).?),
+        .source = sourceSlot(plan, cl.from),
+        .from_node = cl.from.node,
+        .gain = cl.gain,
+    });
+    append(st, .{
+        .to_node = cl.to.node.?,
+        .to_port = @intCast(cl.to.index),
+        .source = plan.n_external_slots + st.out_cursor +
+            contract.slotsBefore(sig.outputs, sig.outputIndex(port_name).?),
+        .from_node = x_node,
+        .gain = 1.0,
+    });
+    if (t.needs_attitude) try appendAttitude(spec, plan, body.?, x_node, sig, st, diag);
+    st.generated += 1;
+    st.node_cursor += 1;
+    st.out_cursor += sig.outputSlots();
+}
+
+fn appendAttitude(
+    spec: *const Spec,
+    plan: *Plan,
+    b: Body,
+    x_node: u16,
+    sig: contract.Signature,
+    st: *BuildState,
+    diag: *Diagnostic,
+) CompileError!void {
+    _ = spec;
+    const b_node = &plan.nodes[b.node];
+    const b_sig = b_node.component.signature();
+    const b_port = b.attitude_port orelse {
+        diag.set("the body has no 'attitude' output for world-frame transforms", .{});
+        return error.BodyHasNoAttitude;
+    };
+    append(st, .{
+        .to_node = x_node,
+        .to_port = @intCast(sig.inputIndex("q").?),
+        .source = plan.n_external_slots + b_node.out_offset +
+            contract.slotsBefore(b_sig.outputs, b_port),
+        .from_node = b.node,
+        .gain = 1.0,
+    });
+}
+
+fn sourceSlot(plan: *const Plan, ep: SpecEndpoint) u16 {
+    if (ep.node) |ni| {
+        const node = &plan.nodes[ni];
+        const sig = node.component.signature();
+        return plan.n_external_slots + node.out_offset +
+            contract.slotsBefore(sig.outputs, ep.index);
+    }
+    return plan.external_offsets[ep.index];
+}
+
+fn generatedName(n: u16, diag: *Diagnostic) CompileError!base.Name {
+    var buf: [limits.max_name_len]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "__x_{d}", .{n}) catch {
+        diag.set("cannot name generated node {d}", .{n});
+        return error.TooManyGeneratedNodes;
+    };
+    return base.Name.init(text) catch {
+        diag.set("generated node name '{s}' is invalid", .{text});
+        return error.TooManyGeneratedNodes;
+    };
+}
+
+// ---------------------------------------------------------------------------------------
+// Drivers, links and order.
+// ---------------------------------------------------------------------------------------
 
 /// Counts the sources of every input port using the (zeroed) wiring table, then rejects a
 /// `single` port with zero or several sources. `layoutLinks` overwrites the table afterwards.
@@ -843,4 +1425,443 @@ test "one buffer can hold plan A, then plan B" {
     const ws_b = plan_mod.Workspace.into(plan_b, &ws_storage);
     _ = plan_b.evaluate(&.{}, &.{5.0}, ws_b);
     try std.testing.expectEqual(@as(f64, 10.0), ws_b.signals[plan_b.signalIndex("b.y").?]);
+}
+
+const body_static: spec_mod.Component = .{ .body = .{ .static = .{} } };
+const load_point: spec_mod.Component = .{ .load = .{ .point = .{} } };
+const world_force: ExternalSpec = .{
+    .name = "f",
+    .dim = base.dim.force,
+    .shape = .vec3,
+    .quantity = .force,
+    .frame = .world,
+};
+
+fn vecAt(ws: *const plan_mod.Workspace, slots: plan_mod.Plan.SignalSlots) base.Vec3 {
+    return .{
+        .x = ws.signals[slots.index],
+        .y = ws.signals[slots.index + 1],
+        .z = ws.signals[slots.index + 2],
+    };
+}
+
+fn expectVec(expected: base.Vec3, actual: base.Vec3) !void {
+    try std.testing.expectApproxEqAbs(expected.x, actual.x, 1.0e-12);
+    try std.testing.expectApproxEqAbs(expected.y, actual.y, 1.0e-12);
+    try std.testing.expectApproxEqAbs(expected.z, actual.z, 1.0e-12);
+}
+
+test "a world vector reaches an identity local port unchanged" {
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point },
+        },
+        .externals = &.{world_force},
+        .connections = &.{.{ .from = "f", .to = "l.force" }},
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    try std.testing.expectEqual(@as(u16, 3), plan.n_nodes);
+    try std.testing.expectEqual(@as(u16, 3), plan.n_links);
+    try std.testing.expectEqual(@as(u16, 3), plan.n_external_slots);
+
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{ 1.0, 2.0, 3.0 }, ws);
+    try expectVec(.{ .x = 1.0, .y = 2.0, .z = 3.0 }, vecAt(ws, plan.signalSlots("l.force").?));
+}
+
+test "the body attitude rotates world into body" {
+    // Yaw of 90 degrees: body +x maps to world +y, so world +x is body -y.
+    const yaw = base.Quat.fromEuler(0.0, 0.0, std.math.pi / 2.0);
+    const spec: Spec = .{
+        .components = &.{
+            .{
+                .name = "body",
+                .component = body_static,
+                .initial_state = &.{ yaw.w, yaw.x, yaw.y, yaw.z },
+            },
+            .{ .name = "l", .component = load_point },
+        },
+        .externals = &.{world_force},
+        .connections = &.{.{ .from = "f", .to = "l.force" }},
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{ 1.0, 0.0, 0.0 }, ws);
+    try expectVec(.{ .y = -1.0 }, vecAt(ws, plan.signalSlots("l.force").?));
+}
+
+test "world to local composes the placement with the body attitude" {
+    // Level body, local frame yawed 90 degrees: world +x becomes local -y.
+    const placement: spec_mod.Placement = .{ .attitude_rad = .{ .z = std.math.pi / 2.0 } };
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point, .placement = placement },
+        },
+        .externals = &.{world_force},
+        .connections = &.{.{ .from = "f", .to = "l.force" }},
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{ 1.0, 0.0, 0.0 }, ws);
+    try expectVec(.{ .y = -1.0 }, vecAt(ws, plan.signalSlots("l.force").?));
+}
+
+test "a local vector rotates between two component frames" {
+    const a_place: spec_mod.Placement = .{ .attitude_rad = .{ .z = 0.3 } };
+    const b_place: spec_mod.Placement = .{ .attitude_rad = .{ .z = -0.5 } };
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "a", .component = load_point, .placement = a_place },
+            .{ .name = "b", .component = load_point, .placement = b_place },
+        },
+        .externals = &.{.{
+            .name = "f",
+            .dim = base.dim.force,
+            .shape = .vec3,
+            .quantity = .force,
+            .frame = .body,
+        }},
+        .connections = &.{
+            .{ .from = "f", .to = "a.force" },
+            .{ .from = "a.force", .to = "b.force" },
+        },
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    const input: base.Vec3 = .{ .x = 1.0, .y = 2.0, .z = 3.0 };
+    _ = plan.evaluate(plan.initial_state, &.{ input.x, input.y, input.z }, ws);
+
+    // f is body-frame, so a.force is already conj(q_a) * input; the A -> B node then gives
+    // conj(q_b) * q_a * (conj(q_a) * input) = conj(q_b) * input.
+    const qb = base.Quat.fromEuler(0.0, 0.0, -0.5);
+    const expected = base.Quat.conjugate(qb).rotate(input);
+    try expectVec(expected, vecAt(ws, plan.signalSlots("b.force").?));
+}
+
+test "a vec3 external occupies three slots" {
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point },
+        },
+        .externals = &.{world_force},
+        .connections = &.{.{ .from = "f", .to = "l.force" }},
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    try std.testing.expectEqual(@as(u16, 3), plan.n_external_slots);
+    try std.testing.expectEqual(@as(usize, 3), plan.external_ptypes[0].width());
+    try std.testing.expectEqual(@as(u16, 0), plan.signalIndex("f").?);
+    const slots = plan.signalSlots("f").?;
+    try std.testing.expectEqual(@as(u16, 0), slots.index);
+    try std.testing.expectEqual(@as(u8, 3), slots.width);
+}
+
+test "a transformed spec fits exactly in bytesNeeded" {
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point },
+        },
+        .externals = &.{world_force},
+        .connections = &.{.{ .from = "f", .to = "l.force" }},
+    };
+    const needed = bytesNeeded(&spec);
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    _ = try compileInto(storage[0..needed], &spec, &diag);
+    try std.testing.expectError(
+        error.BufferTooSmall,
+        compileInto(storage[0 .. needed - 1], &spec, &diag),
+    );
+}
+
+test "a scalar with a frame is refused" {
+    try expectFails(.{
+        .components = &.{},
+        .externals = &.{.{ .name = "x", .dim = base.dim.force, .frame = .body }},
+    }, error.FrameMismatch);
+}
+
+test "a non-finite placement is refused" {
+    try expectFails(.{ .components = &.{.{
+        .name = "a",
+        .component = gain2,
+        .placement = .{ .position_m = .{ .x = std.math.nan(f64) } },
+    }} }, error.BadPlacement);
+}
+
+test "two bodies are ambiguous" {
+    try expectFails(.{ .components = &.{
+        .{ .name = "b1", .component = body_static },
+        .{ .name = "b2", .component = body_static },
+    } }, error.AmbiguousBody);
+}
+
+test "the generated-node prefix is reserved" {
+    try expectFails(.{
+        .components = &.{.{ .name = "__x_0", .component = gain2 }},
+    }, error.InvalidName);
+}
+
+test "an empty quaternion state defaults to the identity" {
+    const spec: Spec = .{
+        .components = &.{.{ .name = "body", .component = body_static }},
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    try std.testing.expectEqualSlices(f64, &.{ 1.0, 0.0, 0.0, 0.0 }, plan.initial_state);
+    try std.testing.expectEqual(@as(usize, 1), plan.attitude_states.len);
+    try std.testing.expectEqual(@as(u16, 0), plan.attitude_states[0]);
+}
+
+test "an initial quaternion is normalized at compile time" {
+    const spec: Spec = .{
+        .components = &.{.{
+            .name = "body",
+            .component = body_static,
+            .initial_state = &.{ 2.0, 0.0, 0.0, 0.0 },
+        }},
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    try std.testing.expectEqualSlices(f64, &.{ 1.0, 0.0, 0.0, 0.0 }, plan.initial_state);
+}
+
+test "a zero initial quaternion is refused" {
+    try expectFails(.{
+        .components = &.{.{
+            .name = "body",
+            .component = body_static,
+            .initial_state = &.{ 0.0, 0.0, 0.0, 0.0 },
+        }},
+    }, error.BadInitialState);
+}
+
+test "the generated-node prefix is reserved for externals too" {
+    try expectFails(.{
+        .components = &.{},
+        .externals = &.{.{ .name = "__x_0", .dim = base.dim.dimensionless }},
+    }, error.InvalidName);
+}
+
+fn wrenchAt(ws: *const plan_mod.Workspace, slots: plan_mod.Plan.SignalSlots) base.Wrench {
+    return .{
+        .force = vecAt(ws, slots),
+        .moment = .{
+            .x = ws.signals[slots.index + 3],
+            .y = ws.signals[slots.index + 4],
+            .z = ws.signals[slots.index + 5],
+        },
+    };
+}
+
+test "a rigid wrench at an offset produces body force and moment" {
+    // A +x force 0.4 m above the CG (z is down) pitches the body nose down: M = r x F = -y.
+    const place: spec_mod.Placement = .{ .position_m = .{ .z = -0.4 } };
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point, .placement = place },
+        },
+        .externals = &.{world_force},
+        .connections = &.{
+            .{ .from = "f", .to = "l.force" },
+            .{ .from = "l.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+
+    // One rotate for f -> l.force, one mount for l.wrench -> body.mount.
+    try std.testing.expectEqual(@as(u16, 4), plan.n_nodes);
+    const mount_slots = plan.signalSlots("__x_1.wrench").?;
+    const body_mount = plan.nodes[0].inputs[0];
+    try std.testing.expectEqual(@as(u16, 1), body_mount.count);
+    try std.testing.expectEqual(mount_slots.index, plan.links[body_mount.first].source);
+
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{ 2.0, 0.0, 0.0 }, ws);
+    const w = wrenchAt(ws, mount_slots);
+    try expectVec(.{ .x = 2.0 }, w.force);
+    try expectVec(.{ .y = -0.8 }, w.moment);
+}
+
+test "a component cannot be rigidly attached twice" {
+    try expectFails(.{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point },
+        },
+        .connections = &.{
+            .{ .from = "l.wrench", .to = "body.mount", .attachment = .rigid },
+            .{ .from = "l.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    }, error.MultiplyDriven);
+}
+
+test "a rigid attachment from a non-wrench output is refused" {
+    try expectFails(.{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point },
+        },
+        .connections = &.{
+            .{ .from = "l.force", .to = "body.mount", .attachment = .rigid },
+        },
+    }, error.RigidAttachmentNotWrench);
+}
+
+test "a rigid attachment from an external is refused" {
+    try expectFails(.{
+        .components = &.{.{ .name = "body", .component = body_static }},
+        .externals = &.{.{
+            .name = "w",
+            .dim = base.dim.force,
+            .shape = .wrench,
+            .quantity = .wrench,
+            .frame = .world,
+        }},
+        .connections = &.{
+            .{ .from = "w", .to = "body.mount", .attachment = .rigid },
+        },
+    }, error.RigidAttachmentNotWrench);
+}
+
+test "a rigid attachment to something other than the mount is refused" {
+    try expectFails(.{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "a", .component = load_point },
+            .{ .name = "b", .component = load_point },
+        },
+        .connections = &.{
+            .{ .from = "a.wrench", .to = "b.moment", .attachment = .rigid },
+        },
+    }, error.RigidAttachmentToNonBody);
+}
+
+test "a rigid attachment needs a body" {
+    try expectFails(.{
+        .components = &.{.{
+            .name = "l",
+            .component = load_point,
+        }},
+        .connections = &.{
+            .{ .from = "l.wrench", .to = "l.moment", .attachment = .rigid },
+        },
+    }, error.AmbiguousBody);
+}
+
+test "a rigid spec fits exactly in bytesNeeded" {
+    const place: spec_mod.Placement = .{ .position_m = .{ .z = -0.4 } };
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point, .placement = place },
+        },
+        .externals = &.{world_force},
+        .connections = &.{
+            .{ .from = "f", .to = "l.force" },
+            .{ .from = "l.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    };
+    const needed = bytesNeeded(&spec);
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    _ = try compileInto(storage[0..needed], &spec, &diag);
+    try std.testing.expectError(
+        error.BufferTooSmall,
+        compileInto(storage[0 .. needed - 1], &spec, &diag),
+    );
+}
+
+test "two components attach rigidly to the same mount" {
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{
+                .name = "a",
+                .component = load_point,
+                .placement = .{ .position_m = .{ .z = -0.4 } },
+            },
+            .{
+                .name = "b",
+                .component = load_point,
+                .placement = .{ .position_m = .{ .x = 0.3 } },
+            },
+        },
+        .connections = &.{
+            .{ .from = "a.wrench", .to = "body.mount", .attachment = .rigid },
+            .{ .from = "b.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    try std.testing.expectEqual(@as(u16, 5), plan.n_nodes);
+    const mount = plan.nodes[0].inputs[0];
+    try std.testing.expectEqual(@as(u16, 2), mount.count);
+    try std.testing.expectEqual(@as(u8, 6), mount.width);
+    // Both links carry a wrench, from the two generated mount nodes.
+    for (plan.links[mount.first..][0..mount.count]) |link| {
+        try std.testing.expect(link.source >= plan.n_external_slots);
+    }
+}
+
+const body_force: ExternalSpec = .{
+    .name = "fb",
+    .dim = base.dim.force,
+    .shape = .vec3,
+    .quantity = .force,
+    .frame = .body,
+};
+
+test "a rigid mount uses the source's orientation and offset" {
+    // Local +x is yawed 90 degrees, so it points along body +y. The offset is 0.4 m above
+    // the CG, so body M = r x F = +x.
+    const place: spec_mod.Placement = .{
+        .position_m = .{ .z = -0.4 },
+        .attitude_rad = .{ .z = std.math.pi / 2.0 },
+    };
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_static },
+            .{ .name = "l", .component = load_point, .placement = place },
+        },
+        .externals = &.{body_force},
+        .connections = &.{
+            .{ .from = "fb", .to = "l.force" },
+            .{ .from = "l.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{ 0.0, 2.0, 0.0 }, ws);
+    const w = wrenchAt(ws, plan.signalSlots("__x_1.wrench").?);
+    try expectVec(.{ .y = 2.0 }, w.force);
+    try expectVec(.{ .x = 0.8 }, w.moment);
 }

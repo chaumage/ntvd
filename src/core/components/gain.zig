@@ -29,9 +29,14 @@ pub const Model = union(enum) {
         };
     }
 
-    pub fn outputs(self: *const Model, x: State, u: In) contract.Evaluated(Out) {
+    pub fn outputs(
+        self: *const Model,
+        x: State,
+        u: In,
+        ctx: contract.Context,
+    ) contract.Evaluated(Out) {
         return switch (self.*) {
-            inline else => |*m| m.outputs(x, u),
+            inline else => |*m| m.outputs(x, u, ctx),
         };
     }
 };
@@ -44,8 +49,14 @@ pub const Linear = struct {
         return null;
     }
 
-    pub fn outputs(self: *const Linear, x: Model.State, u: Model.In) contract.Evaluated(Model.Out) {
+    pub fn outputs(
+        self: *const Linear,
+        x: Model.State,
+        u: Model.In,
+        ctx: contract.Context,
+    ) contract.Evaluated(Model.Out) {
         _ = x;
+        _ = ctx;
         contract.assertFiniteFields(u);
         return .{ .value = .{ .y = self.k * u.x } };
     }
@@ -53,7 +64,7 @@ pub const Linear = struct {
 
 test "linear gain multiplies" {
     const m: Model = .{ .linear = .{ .k = -2.5 } };
-    const r = m.outputs(.{}, .{ .x = 4.0 });
+    const r = m.outputs(.{}, .{ .x = 4.0 }, .{});
     try @import("std").testing.expectEqual(@as(f64, -10.0), r.value.y);
     try @import("std").testing.expectEqual(base.Validity.valid, r.validity);
 }

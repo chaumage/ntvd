@@ -99,6 +99,11 @@ Wide ports occupy consecutive slots in the flat signal and state arrays. One por
 wiring entry, carrying `width` slots; a summing input adds every source slot by slot. The
 plan stores slot offsets and widths, so evaluation stays a flat loop.
 
+Every component function also receives a `contract.Context`, which carries the component's
+resolved `Placement`: where its local frame sits in the body frame and how it is turned. The
+plan fills it in from the spec, so a kind never parses Euler angles or keeps its own copy. A
+kind that only works in its own local frame ignores it.
+
 - A **static** kind has no states; its outputs depend on its inputs (`feedthrough = true`).
 - A **dynamic** kind has states with `dx/dt = f(x, u)`. If its outputs depend on the states
   only (`feedthrough = false`), it breaks algebraic loops. This is what lets
@@ -122,6 +127,18 @@ forces so that every contribution is wired explicitly with its sign).
   human-readable diagnostic ("`speed [m*s^-1] cannot drive body.force [m*kg*s^-2]`").
 - **Plan**: immutable and fully resolved; evaluation is flat loops over indices with no
   lookups and no error paths.
+
+A connection between different frames is accepted when both ends are `vec3`: compile inserts
+a generated `frame_transform` node that rotates the vector into the destination frame. The
+node is an ordinary component with a reserved name (`__x_<n>`), so it inherits evaluation,
+validity and ordering. A `scalar` has no frame and cannot cross one. A world-frame transform
+reads the designated body's `attitude`; if the plan has no such body, compilation fails.
+
+A rigidly attached component is one `.rigid` wire from its local `wrench` output to the
+designated body's `mount` input. Compile generates a single mount node
+(`F_body = R F_local`, `M_body = R M_local + r × F_body`) from the source's placement, and
+`body.mount` sums the contributions of every attached component. A component may attach at
+most once; a second wire is `MultiplyDriven`.
 
 Structural mistakes are therefore caught once, when the model is built, never in a hot loop.
 
@@ -217,10 +234,12 @@ The fuzzer has run 800 000 random architectures across several seeds in ReleaseS
 
 ## 6. Status and roadmap
 
-Done: base layer; component contract with dynamics and fidelity variants; five kinds
-(air, gain, lift_surface, point_mass, thruster); spec/compile/plan; RK4 integration; fuzzer;
-style checker; frame/placement conventions and geometry primitives (`Vec3`, `Quat`, `Rotation`)
-for the 3D work.
+Done: base layer; component contract with dynamics and fidelity variants; eight kinds
+(`air`, `body`, `frame_transform`, `gain`, `lift_surface`, `load`, `point_mass`, `thruster`);
+spec/compile/plan; RK4 integration; fuzzer; style checker; frame/placement conventions and
+geometry primitives (`Vec3`, `Quat`, `Rotation`); placements in the spec, a component
+`Context`, generated cross-frame vector transforms, and single-wire rigid attachment
+(Phase 3).
 
 Next, roughly in order:
 
@@ -244,7 +263,8 @@ Next, roughly in order:
 
 - `point_mass` is one-dimensional. Real vehicle dynamics need frames, rotation and
   attitude. The conventions and geometry primitives are in place; the 3D body and local-frame
-  kinds are new kinds on the existing contract, not a new core.
+  kinds are new kinds on the existing contract, not a new core. Phase 3 has a static `body`,
+  cross-frame vector transforms and rigid attachment; the 6-DOF body follows.
 - The set of kinds is closed (a tagged union): adding one means editing `registry.zig`.
   Third-party kinds would need a separate C-ABI variant.
 - Time integration is fixed-step explicit RK4 with externals held constant over a step. Stiff

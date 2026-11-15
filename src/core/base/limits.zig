@@ -16,7 +16,8 @@ pub const max_slots_per_port: u32 = 6;
 /// Input, output or state slots of one single component, the widest every port can be.
 pub const max_slots: u32 = max_ports * max_slots_per_port;
 
-/// Longest name of a component or external signal, in bytes.
+/// Longest name of a component or external signal, in bytes. Generated transform node names
+/// (`__x_<n>`) are subject to the same limit.
 pub const max_name_len: u32 = 32;
 
 /// Points of one measured curve or one axis of a measured map.

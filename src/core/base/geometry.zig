@@ -201,6 +201,24 @@ pub const Quat = struct {
     }
 };
 
+/// A resolved placement: where a component's local frame sits in the body frame.
+///
+/// `position` is the origin of the local frame in body coordinates, and `orientation` maps
+/// local coordinates to body coordinates. The spec authors the orientation as intrinsic Z-Y-X
+/// Euler angles; `compile` resolves it once to this value so evaluation never converts.
+pub const Placement = struct {
+    position: Vec3 = Vec3.zero,
+    orientation: Quat = Quat.identity,
+
+    pub fn isFinite(self: Placement) bool {
+        return self.position.isFinite() and self.orientation.isFinite();
+    }
+
+    pub fn rotation(self: Placement) Rotation {
+        return self.orientation.toRotation();
+    }
+};
+
 /// A 3x3 rotation matrix, row-major, mapping local to parent coordinates.
 pub const Rotation = struct {
     /// `m[row * 3 + col]`.
