@@ -1930,3 +1930,216 @@ test "a rigid mount uses the source's orientation and offset" {
     try expectVec(.{ .y = 2.0 }, w.force);
     try expectVec(.{ .x = 0.8 }, w.moment);
 }
+
+const wing_linear: spec_mod.Component = .{ .wing = .{ .linear = .{
+    .area_m2 = 1.2,
+    .aspect_ratio = 8.0,
+    .cl_alpha_per_rad = 5.0,
+    .cd0 = 0.02,
+    .oswald = 0.9,
+    .alpha_stall_rad = 0.3,
+} } };
+const airflow_station: spec_mod.Component = .{ .airflow = .{ .station = .{} } };
+
+fn wingCoefficients(alpha: f64) struct { lift: f64, drag: f64 } {
+    const cl = 5.0 * alpha;
+    const cd = 0.02 + cl * cl / (std.math.pi * 0.9 * 8.0);
+    const q_s = 0.5 * 1.225 * 101.0 * 1.2;
+    return .{ .lift = q_s * cl, .drag = q_s * cd };
+}
+
+fn mountedWrench(plan: *const Plan, ws: *const plan_mod.Workspace) !base.Wrench {
+    const body = plan.nodeIndex("body").?;
+    const mount = plan.nodes[body].inputs[0];
+    try std.testing.expect(mount.count > 0);
+    var total: base.Wrench = .{};
+    for (plan.links[mount.first..][0..mount.count]) |link| {
+        total = total.add(wrenchAt(ws, .{ .index = link.source, .width = 6 }));
+    }
+    return total;
+}
+
+test "an airflow and a wing at one station drive the mount with a pitch moment" {
+    const place: spec_mod.Placement = .{ .position_m = .{ .x = 0.4 } };
+    const initial = components.body.initialState(.{ .velocity_body = .{ .x = 10.0, .z = 1.0 } });
+    const spec: Spec = .{
+        .components = &.{
+            .{
+                .name = "body",
+                .component = .{ .body = .{ .six_dof = .{
+                    .mass_kg = 1.0,
+                    .inertia_kg_m2 = .{ .x = 1.0, .y = 1.0, .z = 1.0 },
+                    .gravity_m_s2 = 0.0,
+                } } },
+                .initial_state = &initial,
+            },
+            .{ .name = "station", .component = airflow_station, .placement = place },
+            .{ .name = "wing", .component = wing_linear, .placement = place },
+        },
+        .externals = &.{.{ .name = "rho", .dim = base.dim.density }},
+        .connections = &.{
+            .{ .from = "body.velocity_body", .to = "station.velocity_body" },
+            .{ .from = "body.rate_body", .to = "station.rate_body" },
+            .{ .from = "station.alpha", .to = "wing.alpha" },
+            .{ .from = "station.beta", .to = "wing.beta" },
+            .{ .from = "station.airspeed", .to = "wing.airspeed" },
+            .{ .from = "rho", .to = "wing.density" },
+            .{ .from = "wing.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{1.225}, ws);
+
+    const alpha = std.math.atan2(@as(f64, 1.0), @as(f64, 10.0));
+    const alpha_signal = plan.signalIndex("station.alpha").?;
+    const beta_signal = plan.signalIndex("station.beta").?;
+    const speed_signal = plan.signalIndex("station.airspeed").?;
+    try std.testing.expectApproxEqAbs(alpha, ws.signals[alpha_signal], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), ws.signals[beta_signal], 1e-12);
+    try std.testing.expectApproxEqAbs(@sqrt(101.0), ws.signals[speed_signal], 1e-12);
+
+    const c = wingCoefficients(alpha);
+    const local = wrenchAt(ws, plan.signalSlots("wing.wrench").?);
+    try expectVec(.{ .x = -c.drag, .z = -c.lift }, local.force);
+    try expectVec(.{}, local.moment);
+    const mounted = try mountedWrench(plan, ws);
+    try expectVec(.{ .x = -c.drag, .z = -c.lift }, mounted.force);
+    try expectVec(.{ .y = 0.4 * c.lift }, mounted.moment);
+}
+
+test "a rotated placement turns body flow into local lift" {
+    const place: spec_mod.Placement = .{ .attitude_rad = .{ .z = std.math.pi / 2.0 } };
+    const initial = components.body.initialState(.{ .velocity_body = .{ .y = 10.0, .z = 1.0 } });
+    const spec: Spec = .{
+        .components = &.{
+            .{
+                .name = "body",
+                .component = .{ .body = .{ .six_dof = .{
+                    .mass_kg = 1.0,
+                    .inertia_kg_m2 = .{ .x = 1.0, .y = 1.0, .z = 1.0 },
+                    .gravity_m_s2 = 0.0,
+                } } },
+                .initial_state = &initial,
+            },
+            .{ .name = "station", .component = airflow_station, .placement = place },
+            .{ .name = "wing", .component = wing_linear, .placement = place },
+        },
+        .externals = &.{.{ .name = "rho", .dim = base.dim.density }},
+        .connections = &.{
+            .{ .from = "body.velocity_body", .to = "station.velocity_body" },
+            .{ .from = "body.rate_body", .to = "station.rate_body" },
+            .{ .from = "station.alpha", .to = "wing.alpha" },
+            .{ .from = "station.beta", .to = "wing.beta" },
+            .{ .from = "station.airspeed", .to = "wing.airspeed" },
+            .{ .from = "rho", .to = "wing.density" },
+            .{ .from = "wing.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{1.225}, ws);
+
+    const alpha = std.math.atan2(@as(f64, 1.0), @as(f64, 10.0));
+    const alpha_signal = plan.signalIndex("station.alpha").?;
+    try std.testing.expectApproxEqAbs(alpha, ws.signals[alpha_signal], 1e-12);
+    const c = wingCoefficients(alpha);
+    const mounted = try mountedWrench(plan, ws);
+    // The placement yaw maps local -x (drag) to body -y; local -z (lift) stays body -z.
+    try expectVec(.{ .y = -c.drag, .z = -c.lift }, mounted.force);
+    try expectVec(.{}, mounted.moment);
+}
+
+const flight_externals = [_]ExternalSpec{
+    .{ .name = "alpha", .dim = base.dim.angle },
+    .{ .name = "beta", .dim = base.dim.angle },
+    .{ .name = "airspeed", .dim = base.dim.speed },
+    .{ .name = "rho", .dim = base.dim.density },
+};
+
+test "symmetric wings cancel their moments and add their forces" {
+    const left: spec_mod.Placement = .{ .position_m = .{ .y = 0.4 } };
+    const right: spec_mod.Placement = .{ .position_m = .{ .y = -0.4 } };
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_6dof },
+            .{ .name = "left", .component = wing_linear, .placement = left },
+            .{ .name = "right", .component = wing_linear, .placement = right },
+        },
+        .externals = &flight_externals,
+        .connections = &.{
+            .{ .from = "alpha", .to = "left.alpha" },
+            .{ .from = "beta", .to = "left.beta" },
+            .{ .from = "airspeed", .to = "left.airspeed" },
+            .{ .from = "rho", .to = "left.density" },
+            .{ .from = "alpha", .to = "right.alpha" },
+            .{ .from = "beta", .to = "right.beta" },
+            .{ .from = "airspeed", .to = "right.airspeed" },
+            .{ .from = "rho", .to = "right.density" },
+            .{ .from = "left.wrench", .to = "body.mount", .attachment = .rigid },
+            .{ .from = "right.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{ 0.1, 0.0, @sqrt(101.0), 1.225 }, ws);
+
+    const c = wingCoefficients(0.1);
+    const mounted = try mountedWrench(plan, ws);
+    try expectVec(.{ .x = -2.0 * c.drag, .z = -2.0 * c.lift }, mounted.force);
+    try expectVec(.{}, mounted.moment);
+}
+
+test "a thruster wrench at a lateral offset produces a yaw moment" {
+    const place: spec_mod.Placement = .{ .position_m = .{ .y = 1.0 } };
+    const spec: Spec = .{
+        .components = &.{
+            .{ .name = "body", .component = body_6dof },
+            .{
+                .name = "motor",
+                .component = .{ .thruster = .{ .linear_decay = .{
+                    .static_thrust_n = 40.0,
+                    .max_speed_ms = 60.0,
+                } } },
+                .placement = place,
+            },
+        },
+        .externals = &.{
+            .{ .name = "throttle", .dim = base.dim.dimensionless },
+            .{ .name = "airspeed", .dim = base.dim.speed },
+        },
+        .connections = &.{
+            .{ .from = "throttle", .to = "motor.throttle" },
+            .{ .from = "airspeed", .to = "motor.airspeed" },
+            .{ .from = "motor.wrench", .to = "body.mount", .attachment = .rigid },
+        },
+    };
+    var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const plan = try compileForTest(&spec, &storage, &diag);
+    const ws = plan_mod.Workspace.into(plan, &ws_storage);
+    _ = plan.evaluate(plan.initial_state, &.{ 1.0, 0.0 }, ws);
+
+    const local = wrenchAt(ws, plan.signalSlots("motor.wrench").?);
+    try expectVec(.{ .x = 40.0 }, local.force);
+    try expectVec(.{}, local.moment);
+    const mounted = try mountedWrench(plan, ws);
+    // r x F = (+y) x (+x * T) = -z * T: a yaw moment to the left.
+    try expectVec(.{ .x = 40.0 }, mounted.force);
+    try expectVec(.{ .z = -40.0 }, mounted.moment);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 40.0),
+        ws.signals[plan.signalIndex("motor.thrust").?],
+        1e-12,
+    );
+}

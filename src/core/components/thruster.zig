@@ -1,13 +1,18 @@
 //! Thruster: a propeller, a fan or a water jet delivering thrust along the vehicle axis.
 //!
 //! Inputs   airspeed [m/s] (speed of the vehicle through the fluid), throttle [-] in 0..1
-//! Outputs  thrust [N]
+//! Outputs  thrust [N], plus a local wrench [N, N*m] with force along local `+x` and no moment
+//!
+//! Local axis: x along the thrust axis, positive forward. The wrench lets one `.rigid`
+//! connection mount the thruster, so the compiler adds `r x F` automatically.
 //!
 //! Models
 //!   linear_decay  T = throttle * T0 * (1 - V / Vmax): the usual first estimate of a
 //!                 fixed-pitch propeller from its static thrust and its zero-thrust speed
 //!   speed_table   full-throttle thrust versus speed measured on a test bench or taken
 //!                 from a detailed propeller simulation, scaled by the throttle
+//!
+//! Both outputs always agree: `wrench.force.x == thrust` and `wrench.moment == 0`.
 //!
 //! Validity: throttle outside 0..1 is clamped and flagged; a speed beyond the end of the
 //! model (Vmax, last table point) gives the end value flagged `beyond_envelope`; a
@@ -25,7 +30,7 @@ pub const Model = union(enum) {
     speed_table: SpeedTable,
 
     pub const In = struct { airspeed: f64, throttle: f64 };
-    pub const Out = struct { thrust: f64 };
+    pub const Out = struct { thrust: f64, wrench: base.Wrench };
     pub const State = struct {};
 
     pub const signature = contract.signature(Model, .{
@@ -33,7 +38,10 @@ pub const Model = union(enum) {
             .airspeed = contract.scalar(base.dim.speed),
             .throttle = contract.scalar(base.dim.dimensionless),
         },
-        .out = .{ .thrust = contract.scalar(base.dim.force) },
+        .out = .{
+            .thrust = contract.scalar(base.dim.force),
+            .wrench = contract.wrench(.local),
+        },
         .feedthrough = true,
     });
 
@@ -56,9 +64,17 @@ pub const Model = union(enum) {
 };
 
 const impossible: contract.Evaluated(Model.Out) = .{
-    .value = .{ .thrust = 0.0 },
+    .value = .{ .thrust = 0.0, .wrench = .{} },
     .validity = .invalid,
 };
+
+/// Thrust and the matching local wrench. The moment is zero: a thruster acts along its axis.
+fn evaluated(thrust: f64, validity: base.Validity) contract.Evaluated(Model.Out) {
+    return .{
+        .value = .{ .thrust = thrust, .wrench = .{ .force = .{ .x = thrust } } },
+        .validity = validity,
+    };
+}
 
 /// Throttle clamped into 0..1 and the validity that clamping implies.
 fn throttleOf(u: Model.In) struct { value: f64, validity: base.Validity } {
@@ -95,10 +111,10 @@ pub const LinearDecay = struct {
         const speed_ratio = u.airspeed / self.max_speed_ms;
         const full_throttle = self.static_thrust_n * @max(0.0, 1.0 - speed_ratio);
         const speed_validity: base.Validity = if (speed_ratio > 1.0) .beyond_envelope else .valid;
-        return .{
-            .value = .{ .thrust = throttle.value * full_throttle },
-            .validity = throttle.validity.worst(speed_validity),
-        };
+        return evaluated(
+            throttle.value * full_throttle,
+            throttle.validity.worst(speed_validity),
+        );
     }
 };
 
@@ -127,10 +143,10 @@ pub const SpeedTable = struct {
 
         const throttle = throttleOf(u);
         const full_throttle = self.thrust_n.lookup(u.airspeed);
-        return .{
-            .value = .{ .thrust = throttle.value * full_throttle.value },
-            .validity = throttle.validity.worst(full_throttle.validity),
-        };
+        return evaluated(
+            throttle.value * full_throttle.value,
+            throttle.validity.worst(full_throttle.validity),
+        );
     }
 };
 
@@ -152,6 +168,24 @@ test "linear decay thrust at known points" {
     const at_vmax = m.outputs(.{}, .{ .airspeed = 60.0, .throttle = 1.0 }, .{});
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), at_vmax.value.thrust, 1e-12);
     try std.testing.expectEqual(base.Validity.valid, at_vmax.validity);
+}
+
+test "the local wrench mirrors the scalar thrust" {
+    const models = [_]Model{
+        .{ .linear_decay = sampleThruster() },
+        .{ .speed_table = try sampledTable() },
+    };
+    for (&models) |*m| {
+        const r = m.outputs(.{}, .{ .airspeed = 12.0, .throttle = 0.5 }, .{});
+        try std.testing.expectEqual(r.value.thrust, r.value.wrench.force.x);
+        try std.testing.expectEqual(@as(f64, 0.0), r.value.wrench.force.y);
+        try std.testing.expectEqual(@as(f64, 0.0), r.value.wrench.force.z);
+        try std.testing.expectEqualDeep(base.Wrench.zero.moment, r.value.wrench.moment);
+        try std.testing.expect(r.value.thrust > 0.0);
+    }
+    const backwards = models[0].outputs(.{}, .{ .airspeed = -1.0, .throttle = 1.0 }, .{});
+    try std.testing.expectEqual(base.Validity.invalid, backwards.validity);
+    try std.testing.expectEqualDeep(base.Wrench.zero, backwards.value.wrench);
 }
 
 test "thrust is linear in the throttle and never negative" {

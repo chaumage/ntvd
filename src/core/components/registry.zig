@@ -15,6 +15,7 @@ const base = @import("base");
 const contract = @import("contract.zig");
 
 pub const air = @import("air.zig");
+pub const airflow = @import("airflow.zig");
 pub const body = @import("body.zig");
 pub const frame_transform = @import("frame_transform.zig");
 pub const gain = @import("gain.zig");
@@ -22,9 +23,11 @@ pub const lift_surface = @import("lift_surface.zig");
 pub const load = @import("load.zig");
 pub const point_mass = @import("point_mass.zig");
 pub const thruster = @import("thruster.zig");
+pub const wing = @import("wing.zig");
 
 pub const Component = union(enum) {
     air: air.Model,
+    airflow: airflow.Model,
     body: body.Model,
     frame_transform: frame_transform.Model,
     gain: gain.Model,
@@ -32,6 +35,7 @@ pub const Component = union(enum) {
     load: load.Model,
     point_mass: point_mass.Model,
     thruster: thruster.Model,
+    wing: wing.Model,
 
     pub fn signature(self: *const Component) *const contract.Signature {
         return switch (self.*) {
@@ -117,10 +121,11 @@ test "flat evaluation through the union matches the typed model" {
         .max_speed_ms = 60.0,
     } };
     const c: Component = .{ .thruster = model };
-    var y: [1]f64 = undefined;
+    var y: [7]f64 = undefined;
     const v = c.outputs(&.{}, &.{ 12.0, 0.5 }, &y, .{});
     const typed = model.outputs(.{}, .{ .airspeed = 12.0, .throttle = 0.5 }, .{});
     try std.testing.expectEqual(typed.value.thrust, y[0]);
+    try std.testing.expectEqual(typed.value.thrust, y[1]);
     try std.testing.expectEqual(typed.validity, v);
 }
 

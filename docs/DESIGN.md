@@ -24,7 +24,7 @@ Out of scope for the core: user interface, file formats, plotting. They are shel
 src/core/               the solver (built today)
   L3  solve        time integration; (planned) Newton, trim, algebraic loops
   L2  model        Spec -> compile -> Plan (+ Workspace)
-  L1  components   contract + kinds (air, gain, lift_surface, point_mass, thruster)
+  L1  components   contract + kinds (air, airflow, body, gain, lift_surface, wing, ...)
   L0  base         dim, units, geometry, validity, tables, linalg, rng, atmosphere, limits
 ```
 
@@ -234,13 +234,14 @@ The fuzzer has run 800 000 random architectures across several seeds in ReleaseS
 
 ## 6. Status and roadmap
 
-Done: base layer; component contract with dynamics and fidelity variants; eight kinds
-(`air`, `body`, `frame_transform`, `gain`, `lift_surface`, `load`, `point_mass`, `thruster`);
-spec/compile/plan; RK4 integration; fuzzer; style checker; frame/placement conventions and
-geometry primitives (`Vec3`, `Quat`, `Rotation`); placements in the spec, a component
-`Context`, generated cross-frame vector transforms, and single-wire rigid attachment
+Done: base layer; component contract with dynamics and fidelity variants; ten kinds
+(`air`, `airflow`, `body`, `frame_transform`, `gain`, `lift_surface`, `load`, `point_mass`,
+`thruster`, `wing`); spec/compile/plan; RK4 integration; fuzzer; style checker; frame/placement
+conventions and geometry primitives (`Vec3`, `Quat`, `Rotation`); placements in the spec, a
+component `Context`, generated cross-frame vector transforms, and single-wire rigid attachment
 (Phase 3); the 6-DOF body with Newton-Euler dynamics, gravity, quaternion kinematics and
-post-step normalization (Phase 4).
+post-step normalization (Phase 4); local-frame aero with `airflow` stations, `wing` linear and
+polar-table models, and thruster wrenches for rigid attachment (Phase 5).
 
 Next, roughly in order:
 
@@ -253,8 +254,8 @@ Next, roughly in order:
    and constraints over analysis outputs; Nelder-Mead and CMA-ES first, NSGA-II later.
    Infeasible or `beyond_envelope` points penalized, never NaN.
 4. **More kinds** to prove the core is vehicle-agnostic: hull resistance, foil with ground and
-   surface effect, motor, battery, rigid body in 3D. The real test is that foils and hulls
-   fit without touching `model` or `solve`.
+   surface effect, motor, battery, aero moments from measured tables. The real test is that
+   foils and hulls fit without touching `model` or `solve`.
 5. **Model variants** beyond tables: 2D tables for propeller maps are in `base.interp` but not
    yet used by a kind; a surrogate variant; a bridge to external simulation results.
 6. **I/O and C ABI**: JSON (strictly validated) for specs and results; a stable C interface,
@@ -262,9 +263,13 @@ Next, roughly in order:
 
 ## 7. Known limitations
 
-- The 6-DOF body models principal inertia only (no products of inertia), and velocity or
-  acceleration transforms involving a local frame are refused until the rate shift `ω × r` is
-  implemented. `point_mass` remains the one-dimensional sizing kind.
+- The 6-DOF body models principal inertia only (no products of inertia). The generic
+  cross-frame velocity transform still refuses a local destination; local flow comes from an
+  `airflow` station, which applies the rate shift `ω × r`. `point_mass` remains the
+  one-dimensional sizing kind.
+- A `wing` has no intrinsic pitching moment: `wrench.moment` is zero. A measured moment model
+  is a future extension. An airflow station and the surface it feeds must be given the same
+  placement; the compiler cannot check that agreement.
 - The set of kinds is closed (a tagged union): adding one means editing `registry.zig`.
   Third-party kinds would need a separate C-ABI variant.
 - Time integration is fixed-step explicit RK4 with externals held constant over a step. Stiff

@@ -309,3 +309,220 @@ test "random architectures of gains evaluate to the product of their gains" {
         try std.testing.expectApproxEqRel(expected, ws.signals[plan.signalIndex(tail).?], 1e-12);
     }
 }
+
+/// A small 3D aircraft: two wings, one thruster, air, one airflow station per aero surface.
+/// Gravity is off so the test isolates the aerodynamic and propulsive forces.
+pub const aircraft = struct {
+    pub const mass_kg = 2.0;
+    pub const area_m2 = 1.2;
+    pub const thrust_n = 40.0;
+    pub const v_max_ms = 60.0;
+    pub const density = 1.225;
+    pub const velocity = base.Vec3{ .x = 30.0, .z = 2.0 };
+
+    pub const externals = [_]spec_mod.ExternalSpec{
+        .{ .name = "altitude", .dim = base.dim.length },
+        .{ .name = "throttle", .dim = base.dim.dimensionless },
+    };
+
+    const initial = components_mod.body.initialState(.{ .velocity_body = velocity });
+
+    pub fn wingModel() components_mod.wing.Model {
+        return .{ .linear = .{
+            .area_m2 = area_m2,
+            .aspect_ratio = 8.0,
+            .cl_alpha_per_rad = 5.0,
+            .cd0 = 0.02,
+            .oswald = 0.9,
+            .alpha_stall_rad = 0.3,
+        } };
+    }
+
+    pub fn components() [8]spec_mod.ComponentSpec {
+        const left: spec_mod.Placement = .{ .position_m = .{ .y = 1.0 } };
+        const right: spec_mod.Placement = .{ .position_m = .{ .y = -1.0 } };
+        return .{
+            .{
+                .name = "body",
+                .component = .{ .body = .{ .six_dof = .{
+                    .mass_kg = mass_kg,
+                    .inertia_kg_m2 = .{ .x = 0.5, .y = 1.0, .z = 1.5 },
+                    .gravity_m_s2 = 0.0,
+                } } },
+                .initial_state = &initial,
+            },
+            .{
+                .name = "air",
+                .component = .{ .air = .{ .fixed = .{
+                    .density_kg_m3 = density,
+                    .speed_of_sound_ms = 340.0,
+                } } },
+            },
+            .{
+                .name = "left_station",
+                .component = .{ .airflow = .{ .station = .{} } },
+                .placement = left,
+            },
+            .{ .name = "left_wing", .component = .{ .wing = wingModel() }, .placement = left },
+            .{
+                .name = "right_station",
+                .component = .{ .airflow = .{ .station = .{} } },
+                .placement = right,
+            },
+            .{ .name = "right_wing", .component = .{ .wing = wingModel() }, .placement = right },
+            .{ .name = "nose_station", .component = .{ .airflow = .{ .station = .{} } } },
+            .{
+                .name = "motor",
+                .component = .{ .thruster = .{ .linear_decay = .{
+                    .static_thrust_n = thrust_n,
+                    .max_speed_ms = v_max_ms,
+                } } },
+            },
+        };
+    }
+
+    pub const connections = [_]spec_mod.ConnectionSpec{
+        .{ .from = "altitude", .to = "air.altitude" },
+        .{ .from = "body.velocity_body", .to = "left_station.velocity_body" },
+        .{ .from = "body.rate_body", .to = "left_station.rate_body" },
+        .{ .from = "body.velocity_body", .to = "right_station.velocity_body" },
+        .{ .from = "body.rate_body", .to = "right_station.rate_body" },
+        .{ .from = "body.velocity_body", .to = "nose_station.velocity_body" },
+        .{ .from = "body.rate_body", .to = "nose_station.rate_body" },
+        .{ .from = "left_station.alpha", .to = "left_wing.alpha" },
+        .{ .from = "left_station.beta", .to = "left_wing.beta" },
+        .{ .from = "left_station.airspeed", .to = "left_wing.airspeed" },
+        .{ .from = "right_station.alpha", .to = "right_wing.alpha" },
+        .{ .from = "right_station.beta", .to = "right_wing.beta" },
+        .{ .from = "right_station.airspeed", .to = "right_wing.airspeed" },
+        .{ .from = "air.density", .to = "left_wing.density" },
+        .{ .from = "air.density", .to = "right_wing.density" },
+        .{ .from = "nose_station.airspeed", .to = "motor.airspeed" },
+        .{ .from = "throttle", .to = "motor.throttle" },
+        .{ .from = "left_wing.wrench", .to = "body.mount", .attachment = .rigid },
+        .{ .from = "right_wing.wrench", .to = "body.mount", .attachment = .rigid },
+        .{ .from = "motor.wrench", .to = "body.mount", .attachment = .rigid },
+    };
+
+    pub fn spec(comps: *const [8]spec_mod.ComponentSpec) Spec {
+        return .{ .components = comps, .externals = &externals, .connections = &connections };
+    }
+
+    pub const forces = struct { lift: f64, drag: f64, thrust: f64 };
+
+    pub fn forcesAt(throttle: f64) forces {
+        const speed = velocity.norm();
+        const alpha = std.math.atan2(velocity.z, velocity.x);
+        const q_s = 0.5 * density * speed * speed * area_m2;
+        const cl = 5.0 * alpha;
+        const cd = 0.02 + cl * cl / (std.math.pi * 0.9 * 8.0);
+        return .{
+            .lift = q_s * cl,
+            .drag = q_s * cd,
+            .thrust = throttle * thrust_n * @max(0.0, 1.0 - speed / v_max_ms),
+        };
+    }
+};
+
+test "a 3D aircraft: local airflow drives wings whose forces reach the body" {
+    var plan_storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const comps = aircraft.components();
+    const plan = try compileOrFail(&aircraft.spec(&comps), &plan_storage, &diag);
+    const ws = Workspace.into(plan, &ws_storage);
+
+    try std.testing.expectEqual(@as(u16, 11), plan.n_nodes);
+    try std.testing.expectEqual(@as(u16, 13), plan.n_states);
+
+    var x: [13]f64 = undefined;
+    plan.copyInitialState(&x);
+    var dx: [13]f64 = undefined;
+    const externals = [_]f64{ 0.0, 1.0 };
+    const validity = plan.rhs(&x, &externals, ws, &dx);
+    try std.testing.expectEqual(base.Validity.valid, validity);
+
+    // Both stations see the same flow, and the wing at each station consumes it.
+    const alpha = std.math.atan2(aircraft.velocity.z, aircraft.velocity.x);
+    const speed = aircraft.velocity.norm();
+    const alpha_stations = [_][]const u8{
+        "left_station.alpha",
+        "right_station.alpha",
+        "nose_station.alpha",
+    };
+    for (alpha_stations) |name| {
+        try std.testing.expectApproxEqAbs(alpha, ws.signals[plan.signalIndex(name).?], 1e-12);
+    }
+    const beta_stations = [_][]const u8{
+        "left_station.beta",
+        "right_station.beta",
+        "nose_station.beta",
+    };
+    for (beta_stations) |name| {
+        const beta = ws.signals[plan.signalIndex(name).?];
+        try std.testing.expectApproxEqAbs(@as(f64, 0.0), beta, 1e-12);
+    }
+    for ([_][]const u8{ "left_station.airspeed", "right_station.airspeed" }) |name| {
+        try std.testing.expectApproxEqAbs(speed, ws.signals[plan.signalIndex(name).?], 1e-12);
+    }
+
+    const f = aircraft.forcesAt(1.0);
+    const left = plan.signalSlots("left_wing.wrench").?;
+    try std.testing.expectApproxEqRel(-f.drag, ws.signals[left.index], 1e-12);
+    try std.testing.expectApproxEqRel(-f.lift, ws.signals[left.index + 2], 1e-12);
+    const motor = plan.signalSlots("motor.wrench").?;
+    try std.testing.expectApproxEqRel(f.thrust, ws.signals[motor.index], 1e-12);
+
+    // Gravity is off: Newton-Euler reduces to F/m in the body frame.
+    const v = plan.stateIndex("body.velocity_body").?;
+    try std.testing.expectApproxEqRel(
+        (f.thrust - 2.0 * f.drag) / aircraft.mass_kg,
+        dx[v],
+        1e-12,
+    );
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), dx[v + 1], 1e-12);
+    try std.testing.expectApproxEqRel(-f.lift, dx[v + 2], 1e-12);
+
+    // Symmetry: the two wings cancel their roll moments and the motor is on the axis.
+    const rate = plan.stateIndex("body.rate_body").?;
+    for (dx[rate..][0..3]) |d| try std.testing.expectApproxEqAbs(@as(f64, 0.0), d, 1e-12);
+
+    // A level body: position rate is body velocity and the attitude does not move.
+    const position = plan.stateIndex("body.position_world").?;
+    for (0..3) |i| try std.testing.expectEqual(x[v + i], dx[position + i]);
+    const attitude = plan.stateIndex("body.attitude").?;
+    for (dx[attitude..][0..4]) |d| try std.testing.expectEqual(@as(f64, 0.0), d);
+}
+
+test "the 3D aircraft stays total under non-finite inputs" {
+    var plan_storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(plan_mod.storage_alignment) = undefined;
+    var diag: Diagnostic = .{};
+    const comps = aircraft.components();
+    const plan = try compileOrFail(&aircraft.spec(&comps), &plan_storage, &diag);
+    const ws = Workspace.into(plan, &ws_storage);
+
+    const bad_values = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 1e308 };
+    var dx: [13]f64 = undefined;
+    for (bad_values) |bad| {
+        var x: [13]f64 = undefined;
+        plan.copyInitialState(&x);
+        const cases = [_]struct { x: [13]f64, ext: [2]f64 }{
+            .{ .x = x, .ext = .{ bad, 1.0 } },
+            .{ .x = x, .ext = .{ 0.0, bad } },
+            .{ .x = x, .ext = .{ 0.0, 1.0 } },
+            .{ .x = blk: {
+                var poisoned = x;
+                poisoned[0] = bad;
+                break :blk poisoned;
+            }, .ext = .{ 0.0, 1.0 } },
+        };
+        for (cases) |c| {
+            _ = plan.rhs(&c.x, &c.ext, ws, &dx);
+            for (ws.signals[plan.n_external_slots..plan.n_signals]) |s| {
+                try std.testing.expect(std.math.isFinite(s));
+            }
+            for (dx) |d| try std.testing.expect(std.math.isFinite(d));
+        }
+    }
+}

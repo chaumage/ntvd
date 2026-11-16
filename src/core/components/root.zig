@@ -9,6 +9,7 @@ pub const registry = @import("registry.zig");
 pub const Component = registry.Component;
 
 pub const air = registry.air;
+pub const airflow = registry.airflow;
 pub const body = registry.body;
 pub const frame_transform = registry.frame_transform;
 pub const gain = registry.gain;
@@ -16,11 +17,13 @@ pub const lift_surface = registry.lift_surface;
 pub const load = registry.load;
 pub const point_mass = registry.point_mass;
 pub const thruster = registry.thruster;
+pub const wing = registry.wing;
 
 test {
     _ = @import("contract.zig");
     _ = @import("registry.zig");
     _ = @import("air.zig");
+    _ = @import("airflow.zig");
     _ = @import("body.zig");
     _ = @import("frame_transform.zig");
     _ = @import("gain.zig");
@@ -28,4 +31,5 @@ test {
     _ = @import("load.zig");
     _ = @import("point_mass.zig");
     _ = @import("thruster.zig");
+    _ = @import("wing.zig");
 }

@@ -26,6 +26,25 @@ ones are:
   Positive angle of attack gives lift along local `-z`; positive drag is along local `-x`;
   positive sideslip gives side force along local `+y`.
 - **Thruster:** `x` along the thrust axis, positive forward.
+- **Airflow station:** reports the flow in the local axes of its placement. Positive angle of
+  attack means the local velocity points along `+z`; positive sideslip means it points along
+  `+y`. Pair an airflow station with every aero surface that consumes it, using the **same
+  placement** on both. The compiler cannot check that agreement: a different placement silently
+  describes a different station.
+
+The local flow at a station placed at `r` with body-to-local rotation `R`, for body velocity `v`
+and body rate `omega`, is
+
+```
+v_local  = R^T (v + omega x r)
+alpha    = atan2(v_local.z, v_local.x)
+beta     = atan2(v_local.y, sqrt(v_local.x^2 + v_local.z^2))
+airspeed = |v_local|
+```
+
+The rate term `omega x r` is applied inside the `airflow` kind. The generic cross-frame velocity
+transform still refuses a local destination; use `airflow` rather than wiring a velocity into a
+local port.
 
 ## 2. Placements
 
@@ -57,13 +76,15 @@ M_body = R · M_local + r_body × F_body
 
 Each row is an invariant. Geometric and rigid-body rows are pinned today by tests in
 `src/core/base/geometry.zig`, `src/core/components/body.zig` and `src/core/model/compile.zig`;
-aerodynamic rows are pinned by the Phase 5 tests in the implementation plan, and the table is
-not complete until their tests exist.
+aerodynamic rows are pinned by tests in `src/core/components/airflow.zig` and
+`src/core/components/wing.zig`.
 
 | Operation | Expected result | Pinned by |
 |---|---|---|
-| positive `alpha` on a wing | lift along local `-z` | Phase 5 |
-| positive `beta` on a wing | side force along local `+y` | Phase 5 |
+| local velocity along `+z` at a station | positive `alpha` | `airflow: positive signs follow the local axes` |
+| local velocity along `+y` at a station | positive `beta` | `airflow: positive signs follow the local axes` |
+| positive `alpha` on a wing | lift along local `-z` | `wing: positive alpha lifts along local -z and drags along local -x` |
+| positive `beta` on a wing | side force along local `+y` | `wing: positive beta gives a side force along local +y` |
 | positive roll rate `p` | right wing down | `Quat: positive body rates match the sign table` |
 | positive pitch rate `q` | nose up | `Quat: positive body rates match the sign table` |
 | positive yaw rate `r` | nose right | `Quat: positive body rates match the sign table` |
@@ -118,9 +139,10 @@ attitude_dot = ½ attitude · (0, ω)
   cannot form an algebraic loop through the mount.
 - `gravity_m_s2` defaults to `g0` and zero disables gravity. Only principal moments of inertia
   are modelled; products of inertia are a future extension.
-- Acceleration transforms are refused entirely; velocity transforms involving a **local** frame
-  are refused until the rate shift `ω × r` is implemented. The static transform of §2 is all
-  that is applied today, together with pure rotations between world and body.
+- Acceleration transforms are refused entirely; the generic cross-frame velocity transform still
+  refuses a local frame. Use the `airflow` kind, which applies the rate shift `omega x r` at its
+  own placement. Pure rotations between world and body and the static placement transform of §2
+  are all the graph applies.
 
 ## 7. Reserved identifiers
 
