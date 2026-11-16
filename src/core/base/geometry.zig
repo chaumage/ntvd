@@ -426,6 +426,28 @@ test "Quat: derivative of a pure roll rate" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), d.z, tolerance);
 }
 
+test "Quat: positive body rates match the sign table" {
+    const dt = 1.0e-3;
+    // A small step of the quaternion kinematics, then the rotation it produces.
+    const roll = stepFromRate(.{ .x = 1.0 }, dt);
+    try std.testing.expect(roll.rotate(.{ .y = 1.0 }).z > 0.0); // right wing down
+    const pitch = stepFromRate(.{ .y = 1.0 }, dt);
+    try std.testing.expect(pitch.rotate(.{ .x = 1.0 }).z < 0.0); // nose up
+    const yaw = stepFromRate(.{ .z = 1.0 }, dt);
+    try std.testing.expect(yaw.rotate(.{ .x = 1.0 }).y > 0.0); // nose right
+}
+
+fn stepFromRate(omega: Vec3, dt: f64) Quat {
+    const d = Quat.identity.derivative(omega);
+    const q = Quat{
+        .w = 1.0 + dt * d.w,
+        .x = dt * d.x,
+        .y = dt * d.y,
+        .z = dt * d.z,
+    };
+    return q.normalized().?;
+}
+
 test "Quat: integrating a yaw rate gives the analytic rotation" {
     // One radian per second for pi seconds is a 180 degree yaw.
     const omega: Vec3 = .{ .z = 1.0 };

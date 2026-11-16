@@ -92,6 +92,7 @@ pub fn rk4Step(
         out.* = xi + dt / 6.0 * (a + 2.0 * b + 2.0 * c + d);
         if (!std.math.isFinite(out.*)) return error.Diverged;
     }
+    try normalizeAttitudes(plan, stage);
     @memcpy(x, stage);
     return worst;
 }
@@ -99,6 +100,27 @@ pub fn rk4Step(
 /// out = x + h * k
 fn axpy(out: []f64, x: []const f64, h: f64, k: []const f64) void {
     for (out, x, k) |*o, xi, ki| o.* = xi + h * ki;
+}
+
+/// Renormalizes every quaternion state in `state`. On a zero or non-finite norm the step is
+/// refused before the caller's state is touched.
+fn normalizeAttitudes(plan: *const Plan, state: []f64) StepError!void {
+    for (plan.attitude_states) |offset| {
+        const start: usize = offset;
+        assert(start + 4 <= state.len);
+        const values = state[start..][0..4];
+        const q = base.Quat{
+            .w = values[0],
+            .x = values[1],
+            .y = values[2],
+            .z = values[3],
+        };
+        const normalized = base.Quat.normalized(q) orelse return error.Diverged;
+        values[0] = normalized.w;
+        values[1] = normalized.x;
+        values[2] = normalized.y;
+        values[3] = normalized.z;
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -230,4 +252,234 @@ test "nonsense time steps are refused" {
         const result = rk4Step(plan, &x, &ext, dt, built.ws);
         try std.testing.expectError(error.Diverged, result);
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Six-degree-of-freedom body
+// ---------------------------------------------------------------------------------------
+
+/// A body alone, driven by one body-frame wrench external. The mount port sums, so a zero
+/// external means no applied wrench.
+const six_dof = struct {
+    const mass_kg = 2.0;
+    const inertia: base.Vec3 = .{ .x = 1.0, .y = 2.0, .z = 4.0 };
+    const n_states = 13;
+
+    const externals = [_]model.ExternalSpec{.{
+        .name = "w",
+        .dim = base.dim.force,
+        .shape = .wrench,
+        .quantity = .wrench,
+        .frame = .body,
+    }};
+
+    const connections = [_]model.ConnectionSpec{
+        .{ .from = "w", .to = "body.mount" },
+    };
+
+    const Built = struct { plan: *const Plan, ws: *Workspace };
+
+    fn build(
+        plan_storage: storage.Buffer,
+        ws_storage: storage.Buffer,
+        diag: *model.Diagnostic,
+        gravity_m_s2: f64,
+    ) !Built {
+        var comps = [_]model.ComponentSpec{.{
+            .name = "body",
+            .component = .{ .body = .{ .six_dof = .{
+                .mass_kg = mass_kg,
+                .inertia_kg_m2 = inertia,
+                .gravity_m_s2 = gravity_m_s2,
+            } } },
+        }};
+        const spec: model.Spec = .{
+            .components = &comps,
+            .externals = &externals,
+            .connections = &connections,
+        };
+        const plan = try model.compileInto(plan_storage, &spec, diag);
+        return .{ .plan = plan, .ws = Workspace.into(plan, ws_storage) };
+    }
+};
+
+fn stateVec(plan: *const Plan, x: []const f64, name: []const u8) base.Vec3 {
+    const i = plan.stateIndex(name).?;
+    return .{ .x = x[i], .y = x[i + 1], .z = x[i + 2] };
+}
+
+fn stateQuat(plan: *const Plan, x: []const f64, name: []const u8) base.Quat {
+    const i = plan.stateIndex(name).?;
+    return .{ .w = x[i], .x = x[i + 1], .y = x[i + 2], .z = x[i + 3] };
+}
+
+fn writeQuat(x: []f64, index: u16, q: base.Quat) void {
+    const i: usize = index;
+    x[i] = q.w;
+    x[i + 1] = q.x;
+    x[i + 2] = q.y;
+    x[i + 3] = q.z;
+}
+
+fn signalVec(ws: *const model.Workspace, plan: *const Plan, name: []const u8) base.Vec3 {
+    const slots = plan.signalSlots(name).?;
+    return .{
+        .x = ws.signals[slots.index],
+        .y = ws.signals[slots.index + 1],
+        .z = ws.signals[slots.index + 2],
+    };
+}
+
+fn expectVec(expected: base.Vec3, actual: base.Vec3) !void {
+    try std.testing.expectApproxEqAbs(expected.x, actual.x, 1.0e-12);
+    try std.testing.expectApproxEqAbs(expected.y, actual.y, 1.0e-12);
+    try std.testing.expectApproxEqAbs(expected.z, actual.z, 1.0e-12);
+}
+
+fn normSquared(q: base.Quat) f64 {
+    return q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+}
+
+test "a constant body force accelerates in body and world frames" {
+    var plan_storage: [test_plan_bytes]u8 align(storage.alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(storage.alignment) = undefined;
+    var diag: model.Diagnostic = .{};
+    const built = try six_dof.build(&plan_storage, &ws_storage, &diag, 0.0);
+    const plan = built.plan;
+
+    var x: [six_dof.n_states]f64 = undefined;
+    plan.copyInitialState(&x);
+    // Yaw 90 degrees: a body +x force points along world +y.
+    writeQuat(
+        &x,
+        plan.stateIndex("body.attitude").?,
+        base.Quat.fromEuler(0.0, 0.0, std.math.pi / 2.0),
+    );
+
+    const ext = [_]f64{ 2.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    const dt = 0.01;
+    for (0..100) |_| _ = try rk4Step(plan, &x, &ext, dt, built.ws);
+
+    try expectVec(.{ .x = 1.0 }, stateVec(plan, &x, "body.velocity_body"));
+    try expectVec(.{ .y = 0.5 }, stateVec(plan, &x, "body.position_world"));
+
+    _ = plan.evaluate(&x, &ext, &built.ws.model);
+    try expectVec(.{ .y = 1.0 }, signalVec(&built.ws.model, plan, "body.velocity_world"));
+}
+
+test "free fall in NED matches z = half g t squared" {
+    var plan_storage: [test_plan_bytes]u8 align(storage.alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(storage.alignment) = undefined;
+    var diag: model.Diagnostic = .{};
+    const built = try six_dof.build(&plan_storage, &ws_storage, &diag, base.units.g0);
+    const plan = built.plan;
+
+    var x: [six_dof.n_states]f64 = undefined;
+    plan.copyInitialState(&x);
+    const ext = [_]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    const dt = 1.0e-3;
+    const steps = 10_000;
+    for (0..steps) |_| _ = try rk4Step(plan, &x, &ext, dt, built.ws);
+
+    const t = dt * @as(f64, @floatFromInt(steps));
+    const z = 0.5 * base.units.g0 * t * t;
+    try std.testing.expectApproxEqAbs(z, stateVec(plan, &x, "body.position_world").z, 1.0e-8);
+    try std.testing.expectApproxEqAbs(
+        base.units.g0 * t,
+        stateVec(plan, &x, "body.velocity_body").z,
+        1.0e-10,
+    );
+}
+
+test "a torque-free spinner conserves angular momentum and energy" {
+    var plan_storage: [test_plan_bytes]u8 align(storage.alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(storage.alignment) = undefined;
+    var diag: model.Diagnostic = .{};
+    const built = try six_dof.build(&plan_storage, &ws_storage, &diag, 0.0);
+    const plan = built.plan;
+
+    const rate: base.Vec3 = .{ .x = 1.0, .y = 2.0, .z = 3.0 };
+    const h0 = base.Vec3{
+        .x = six_dof.inertia.x * rate.x,
+        .y = six_dof.inertia.y * rate.y,
+        .z = six_dof.inertia.z * rate.z,
+    };
+    const energy0 = 0.5 * base.Vec3.dot(rate, h0);
+    const ext = [_]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+
+    var x: [six_dof.n_states]f64 = undefined;
+    plan.copyInitialState(&x);
+    const rate_index = plan.stateIndex("body.rate_body").?;
+    x[rate_index] = rate.x;
+    x[rate_index + 1] = rate.y;
+    x[rate_index + 2] = rate.z;
+
+    const dt = 1.0e-3;
+    for (0..10_000) |_| {
+        _ = try rk4Step(plan, &x, &ext, dt, built.ws);
+        try std.testing.expectApproxEqAbs(
+            1.0,
+            normSquared(stateQuat(plan, &x, "body.attitude")),
+            1.0e-12,
+        );
+    }
+
+    const q = stateQuat(plan, &x, "body.attitude");
+    const omega = stateVec(plan, &x, "body.rate_body");
+    const h = base.Vec3{
+        .x = six_dof.inertia.x * omega.x,
+        .y = six_dof.inertia.y * omega.y,
+        .z = six_dof.inertia.z * omega.z,
+    };
+    const h_world = q.rotate(h);
+    const energy = 0.5 * base.Vec3.dot(omega, h);
+    try std.testing.expectApproxEqRel(h0.x, h_world.x, 1.0e-8);
+    try std.testing.expectApproxEqRel(h0.y, h_world.y, 1.0e-8);
+    try std.testing.expectApproxEqRel(h0.z, h_world.z, 1.0e-8);
+    try std.testing.expectApproxEqRel(energy0, energy, 1.0e-8);
+}
+
+test "a zero quaternion stops the step and keeps the last good state" {
+    var plan_storage: [test_plan_bytes]u8 align(storage.alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(storage.alignment) = undefined;
+    var diag: model.Diagnostic = .{};
+    const built = try six_dof.build(&plan_storage, &ws_storage, &diag, 0.0);
+    const plan = built.plan;
+
+    var x: [six_dof.n_states]f64 = undefined;
+    plan.copyInitialState(&x);
+    writeQuat(
+        &x,
+        plan.stateIndex("body.attitude").?,
+        .{ .w = 0.0, .x = 0.0, .y = 0.0, .z = 0.0 },
+    );
+    const before = x;
+    const ext = [_]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    try std.testing.expectError(
+        error.Diverged,
+        rk4Step(plan, &x, &ext, 0.01, built.ws),
+    );
+    try std.testing.expectEqualSlices(f64, &before, &x);
+}
+
+test "the body stays readable when the mount signal is broken" {
+    var plan_storage: [test_plan_bytes]u8 align(storage.alignment) = undefined;
+    var ws_storage: [test_ws_bytes]u8 align(storage.alignment) = undefined;
+    var diag: model.Diagnostic = .{};
+    const built = try six_dof.build(&plan_storage, &ws_storage, &diag, 0.0);
+    const plan = built.plan;
+
+    var x: [six_dof.n_states]f64 = undefined;
+    plan.copyInitialState(&x);
+    const ext = [_]f64{ std.math.nan(f64), 0.0, 0.0, 0.0, 0.0, 0.0 };
+
+    // The body is not feedthrough, so its outputs do not read the broken mount.
+    try std.testing.expectEqual(Validity.valid, plan.evaluate(&x, &ext, &built.ws.model));
+
+    var dx: [six_dof.n_states]f64 = undefined;
+    try std.testing.expectEqual(
+        Validity.invalid,
+        plan.derivatives(&x, &built.ws.model, &dx),
+    );
+    for (dx) |value| try std.testing.expectEqual(@as(f64, 0.0), value);
 }

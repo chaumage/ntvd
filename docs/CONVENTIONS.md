@@ -55,19 +55,20 @@ M_body = R · M_local + r_body × F_body
 
 ## 4. Sign table
 
-Each row is an invariant. Geometric rows are pinned today by tests in
-`src/core/base/geometry.zig`; aerodynamic and rigid-body rows are pinned by the Phase 3–5 tests
-in the implementation plan, and the table is not complete until their tests exist.
+Each row is an invariant. Geometric and rigid-body rows are pinned today by tests in
+`src/core/base/geometry.zig`, `src/core/components/body.zig` and `src/core/model/compile.zig`;
+aerodynamic rows are pinned by the Phase 5 tests in the implementation plan, and the table is
+not complete until their tests exist.
 
 | Operation | Expected result | Pinned by |
 |---|---|---|
 | positive `alpha` on a wing | lift along local `-z` | Phase 5 |
 | positive `beta` on a wing | side force along local `+y` | Phase 5 |
-| positive roll rate `p` | right wing down | Phase 4 |
-| positive pitch rate `q` | nose up | Phase 4 |
-| positive yaw rate `r` | nose right | Phase 4 |
+| positive roll rate `p` | right wing down | `Quat: positive body rates match the sign table` |
+| positive pitch rate `q` | nose up | `Quat: positive body rates match the sign table` |
+| positive yaw rate `r` | nose right | `Quat: positive body rates match the sign table` |
 | force `F = (1, 0, 0)` at `r = (0, 0, -0.4)` (above the CG, z is down) | moment `-y` (`r × F`), nose down | `compile: a rigid wrench at an offset` |
-| gravity at level attitude | body force `(0, 0, +m g)` | Phase 4 |
+| gravity at level attitude | body force `(0, 0, +m g)` | `body: gravity is world-down and rotates into the body frame` |
 | positive yaw of 90° | body `+x` maps to world `+y` | `Quat: identity and basis rotations` |
 | positive pitch of 90° | body `+x` maps to world `-z` (up) | `Quat: identity and basis rotations` |
 | positive roll of 90° | body `+y` maps to world `+z` (down) | `Quat: identity and basis rotations` |
@@ -94,7 +95,34 @@ A component is attached to the vehicle with **one** connection:
 - The connection `gain` is dimensionless and applies to the whole wrench; normally `1.0`.
   Reverse a sign in the component's local vectors, not in the attachment.
 
-## 6. Reserved identifiers
+## 6. Body dynamics
+
+A plan has at most one six-degree-of-freedom body. Its state order is velocity, rate, position,
+attitude:
+
+```
+velocity_body (3)   rate_body (3)   position_world (3)   attitude (4)
+```
+
+Newton-Euler in the rotating body frame, with the origin at the CG and diagonal inertia:
+
+```
+g_body    = conj(attitude) · (0, 0, +g)
+v_dot     = (F_mount + m g_body) / m - ω × v
+ω_dot     = I⁻¹ (M_mount - ω × (I ω))
+p_dot     = attitude · v
+attitude_dot = ½ attitude · (0, ω)
+```
+
+- The body is not feedthrough: its outputs depend on the state alone, so reading the attitude
+  cannot form an algebraic loop through the mount.
+- `gravity_m_s2` defaults to `g0` and zero disables gravity. Only principal moments of inertia
+  are modelled; products of inertia are a future extension.
+- Acceleration transforms are refused entirely; velocity transforms involving a **local** frame
+  are refused until the rate shift `ω × r` is implemented. The static transform of §2 is all
+  that is applied today, together with pure rotations between world and body.
+
+## 7. Reserved identifiers
 
 - Generated nodes are named `__x_<n>`. User components and externals may not use the `__x_`
   prefix.

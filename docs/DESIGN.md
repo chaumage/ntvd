@@ -109,8 +109,8 @@ kind that only works in its own local frame ignores it.
   only (`feedthrough = false`), it breaks algebraic loops. This is what lets
   `velocity -> drag -> force -> acceleration -> velocity` compile with no solver.
 
-This is the extension point for dynamics: richer bodies (3D, 6 degrees of freedom), battery
-and motor transients, actuators are all more states and more ports on the same contract.
+This is the extension point for dynamics: richer bodies, battery and motor transients,
+actuators are all more states and more ports on the same contract.
 `contract.expectKindContract` is a property test every model must pass (finite for any
 finite input, deterministic, and no dependence on inputs when `feedthrough = false`).
 
@@ -239,7 +239,8 @@ Done: base layer; component contract with dynamics and fidelity variants; eight 
 spec/compile/plan; RK4 integration; fuzzer; style checker; frame/placement conventions and
 geometry primitives (`Vec3`, `Quat`, `Rotation`); placements in the spec, a component
 `Context`, generated cross-frame vector transforms, and single-wire rigid attachment
-(Phase 3).
+(Phase 3); the 6-DOF body with Newton-Euler dynamics, gravity, quaternion kinematics and
+post-step normalization (Phase 4).
 
 Next, roughly in order:
 
@@ -261,10 +262,9 @@ Next, roughly in order:
 
 ## 7. Known limitations
 
-- `point_mass` is one-dimensional. Real vehicle dynamics need frames, rotation and
-  attitude. The conventions and geometry primitives are in place; the 3D body and local-frame
-  kinds are new kinds on the existing contract, not a new core. Phase 3 has a static `body`,
-  cross-frame vector transforms and rigid attachment; the 6-DOF body follows.
+- The 6-DOF body models principal inertia only (no products of inertia), and velocity or
+  acceleration transforms involving a local frame are refused until the rate shift `ω × r` is
+  implemented. `point_mass` remains the one-dimensional sizing kind.
 - The set of kinds is closed (a tagged union): adding one means editing `registry.zig`.
   Third-party kinds would need a separate C-ABI variant.
 - Time integration is fixed-step explicit RK4 with externals held constant over a step. Stiff

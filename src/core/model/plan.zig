@@ -160,6 +160,12 @@ pub const Plan = struct {
         return outputs.worst(plan.derivatives(x, ws, dx));
     }
 
+    /// Copies the compiled initial state into a caller-owned vector of exactly `n_states`.
+    pub fn copyInitialState(plan: *const Plan, dest: []f64) void {
+        assert(dest.len == plan.n_states);
+        @memcpy(dest, plan.initial_state);
+    }
+
     fn evaluateNode(plan: *const Plan, node: *const Node, x: []const f64, ws: *Workspace) Validity {
         const n_in: usize = node.n_in;
         var u: [limits.max_slots]f64 = @splat(0.0);

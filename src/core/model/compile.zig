@@ -607,7 +607,7 @@ fn frameTransform(
             return error.FrameMismatch;
         },
         .quat => {
-            diag.set("quaternion frame transforms need the body rate; not available yet", .{});
+            diag.set("quaternion frame transforms are not implemented yet", .{});
             return error.FrameMismatch;
         },
         .wrench => {
@@ -617,7 +617,20 @@ fn frameTransform(
         .vec3 => {},
     }
     if (from.ptype.quantity == .position) {
-        diag.set("position transforms need the body position state; not available yet", .{});
+        diag.set("position transforms are not implemented yet", .{});
+        return error.FrameMismatch;
+    }
+    if (from.ptype.quantity == .acceleration) {
+        diag.set("acceleration transforms are not implemented yet", .{});
+        return error.FrameMismatch;
+    }
+    // A local frame has an origin offset, so a velocity needs `omega x r` in addition to the
+    // rotation. The body now has a rate, but the rate-shift mode is deferred: reject the
+    // wiring rather than silently dropping an inertial term.
+    if (from.ptype.quantity == .velocity and
+        (localNode(from.frame) != null or localNode(to.frame) != null))
+    {
+        diag.set("velocity transforms involving a local frame need rate_shift", .{});
         return error.FrameMismatch;
     }
 
@@ -1427,7 +1440,10 @@ test "one buffer can hold plan A, then plan B" {
     try std.testing.expectEqual(@as(f64, 10.0), ws_b.signals[plan_b.signalIndex("b.y").?]);
 }
 
-const body_static: spec_mod.Component = .{ .body = .{ .static = .{} } };
+const body_6dof: spec_mod.Component = .{ .body = .{ .six_dof = .{
+    .mass_kg = 1.0,
+    .inertia_kg_m2 = .{ .x = 1.0, .y = 1.0, .z = 1.0 },
+} } };
 const load_point: spec_mod.Component = .{ .load = .{ .point = .{} } };
 const world_force: ExternalSpec = .{
     .name = "f",
@@ -1454,7 +1470,7 @@ fn expectVec(expected: base.Vec3, actual: base.Vec3) !void {
 test "a world vector reaches an identity local port unchanged" {
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point },
         },
         .externals = &.{world_force},
@@ -1476,12 +1492,13 @@ test "a world vector reaches an identity local port unchanged" {
 test "the body attitude rotates world into body" {
     // Yaw of 90 degrees: body +x maps to world +y, so world +x is body -y.
     const yaw = base.Quat.fromEuler(0.0, 0.0, std.math.pi / 2.0);
+    const initial = components.body.initialState(.{ .attitude = yaw });
     const spec: Spec = .{
         .components = &.{
             .{
                 .name = "body",
-                .component = body_static,
-                .initial_state = &.{ yaw.w, yaw.x, yaw.y, yaw.z },
+                .component = body_6dof,
+                .initial_state = &initial,
             },
             .{ .name = "l", .component = load_point },
         },
@@ -1502,7 +1519,7 @@ test "world to local composes the placement with the body attitude" {
     const placement: spec_mod.Placement = .{ .attitude_rad = .{ .z = std.math.pi / 2.0 } };
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point, .placement = placement },
         },
         .externals = &.{world_force},
@@ -1522,7 +1539,7 @@ test "a local vector rotates between two component frames" {
     const b_place: spec_mod.Placement = .{ .attitude_rad = .{ .z = -0.5 } };
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "a", .component = load_point, .placement = a_place },
             .{ .name = "b", .component = load_point, .placement = b_place },
         },
@@ -1553,10 +1570,54 @@ test "a local vector rotates between two component frames" {
     try expectVec(expected, vecAt(ws, plan.signalSlots("b.force").?));
 }
 
+test "velocity transforms involving a local frame need rate_shift" {
+    const empty: Spec = .{ .components = &.{} };
+    const from: SpecEndpoint = .{
+        .node = null,
+        .index = 0,
+        .ptype = contract.vec3(base.dim.speed, .velocity, .body),
+        .frame = .body,
+    };
+    const to: SpecEndpoint = .{
+        .node = 1,
+        .index = 0,
+        .ptype = contract.vec3(base.dim.speed, .velocity, .local),
+        .frame = .{ .local = 1 },
+    };
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(
+        error.FrameMismatch,
+        frameTransform(&empty, from, to, null, &diag),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "rate_shift") != null);
+}
+
+test "acceleration transforms are refused" {
+    const empty: Spec = .{ .components = &.{} };
+    const from: SpecEndpoint = .{
+        .node = null,
+        .index = 0,
+        .ptype = contract.vec3(base.dim.acceleration, .acceleration, .body),
+        .frame = .body,
+    };
+    const to: SpecEndpoint = .{
+        .node = 1,
+        .index = 0,
+        .ptype = contract.vec3(base.dim.acceleration, .acceleration, .local),
+        .frame = .{ .local = 1 },
+    };
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(
+        error.FrameMismatch,
+        frameTransform(&empty, from, to, null, &diag),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, diag.message(), "acceleration") != null);
+}
+
 test "a vec3 external occupies three slots" {
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point },
         },
         .externals = &.{world_force},
@@ -1576,7 +1637,7 @@ test "a vec3 external occupies three slots" {
 test "a transformed spec fits exactly in bytesNeeded" {
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point },
         },
         .externals = &.{world_force},
@@ -1609,8 +1670,8 @@ test "a non-finite placement is refused" {
 
 test "two bodies are ambiguous" {
     try expectFails(.{ .components = &.{
-        .{ .name = "b1", .component = body_static },
-        .{ .name = "b2", .component = body_static },
+        .{ .name = "b1", .component = body_6dof },
+        .{ .name = "b2", .component = body_6dof },
     } }, error.AmbiguousBody);
 }
 
@@ -1620,38 +1681,42 @@ test "the generated-node prefix is reserved" {
     }, error.InvalidName);
 }
 
-test "an empty quaternion state defaults to the identity" {
+test "an empty body state defaults to zero and identity" {
     const spec: Spec = .{
-        .components = &.{.{ .name = "body", .component = body_static }},
+        .components = &.{.{ .name = "body", .component = body_6dof }},
     };
     var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var diag: Diagnostic = .{};
     const plan = try compileForTest(&spec, &storage, &diag);
-    try std.testing.expectEqualSlices(f64, &.{ 1.0, 0.0, 0.0, 0.0 }, plan.initial_state);
+    const expected = components.body.initialState(.{});
+    try std.testing.expectEqualSlices(f64, &expected, plan.initial_state);
     try std.testing.expectEqual(@as(usize, 1), plan.attitude_states.len);
-    try std.testing.expectEqual(@as(u16, 0), plan.attitude_states[0]);
+    try std.testing.expectEqual(plan.stateIndex("body.attitude").?, plan.attitude_states[0]);
 }
 
-test "an initial quaternion is normalized at compile time" {
+test "an initial body quaternion is normalized at compile time" {
+    const initial = components.body.initialState(.{ .attitude = .{ .w = 2.0 } });
     const spec: Spec = .{
         .components = &.{.{
             .name = "body",
-            .component = body_static,
-            .initial_state = &.{ 2.0, 0.0, 0.0, 0.0 },
+            .component = body_6dof,
+            .initial_state = &initial,
         }},
     };
     var storage: [test_plan_bytes]u8 align(plan_mod.storage_alignment) = undefined;
     var diag: Diagnostic = .{};
     const plan = try compileForTest(&spec, &storage, &diag);
-    try std.testing.expectEqualSlices(f64, &.{ 1.0, 0.0, 0.0, 0.0 }, plan.initial_state);
+    const expected = components.body.initialState(.{});
+    try std.testing.expectEqualSlices(f64, &expected, plan.initial_state);
 }
 
 test "a zero initial quaternion is refused" {
+    const initial = components.body.initialState(.{ .attitude = .{ .w = 0.0 } });
     try expectFails(.{
         .components = &.{.{
             .name = "body",
-            .component = body_static,
-            .initial_state = &.{ 0.0, 0.0, 0.0, 0.0 },
+            .component = body_6dof,
+            .initial_state = &initial,
         }},
     }, error.BadInitialState);
 }
@@ -1679,7 +1744,7 @@ test "a rigid wrench at an offset produces body force and moment" {
     const place: spec_mod.Placement = .{ .position_m = .{ .z = -0.4 } };
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point, .placement = place },
         },
         .externals = &.{world_force},
@@ -1710,7 +1775,7 @@ test "a rigid wrench at an offset produces body force and moment" {
 test "a component cannot be rigidly attached twice" {
     try expectFails(.{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point },
         },
         .connections = &.{
@@ -1723,7 +1788,7 @@ test "a component cannot be rigidly attached twice" {
 test "a rigid attachment from a non-wrench output is refused" {
     try expectFails(.{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point },
         },
         .connections = &.{
@@ -1734,7 +1799,7 @@ test "a rigid attachment from a non-wrench output is refused" {
 
 test "a rigid attachment from an external is refused" {
     try expectFails(.{
-        .components = &.{.{ .name = "body", .component = body_static }},
+        .components = &.{.{ .name = "body", .component = body_6dof }},
         .externals = &.{.{
             .name = "w",
             .dim = base.dim.force,
@@ -1751,7 +1816,7 @@ test "a rigid attachment from an external is refused" {
 test "a rigid attachment to something other than the mount is refused" {
     try expectFails(.{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "a", .component = load_point },
             .{ .name = "b", .component = load_point },
         },
@@ -1777,7 +1842,7 @@ test "a rigid spec fits exactly in bytesNeeded" {
     const place: spec_mod.Placement = .{ .position_m = .{ .z = -0.4 } };
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point, .placement = place },
         },
         .externals = &.{world_force},
@@ -1799,7 +1864,7 @@ test "a rigid spec fits exactly in bytesNeeded" {
 test "two components attach rigidly to the same mount" {
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{
                 .name = "a",
                 .component = load_point,
@@ -1846,7 +1911,7 @@ test "a rigid mount uses the source's orientation and offset" {
     };
     const spec: Spec = .{
         .components = &.{
-            .{ .name = "body", .component = body_static },
+            .{ .name = "body", .component = body_6dof },
             .{ .name = "l", .component = load_point, .placement = place },
         },
         .externals = &.{body_force},
