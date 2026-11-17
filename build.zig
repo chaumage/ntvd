@@ -96,6 +96,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "base", .module = base },
+            .{ .name = "components", .module = components },
             .{ .name = "model", .module = model },
             .{ .name = "fuzz_options", .module = fuzz_options.createModule() },
         },

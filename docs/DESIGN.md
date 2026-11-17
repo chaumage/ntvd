@@ -44,6 +44,21 @@ Planned above it, each with its own directory under `src/`: `optimize/`, `io/`, 
 and eventually a C ABI. They are empty except for a README until the work that motivates them
 lands.
 
+### 2.1 Architecture assessment (Phase 8 review)
+
+**Verdict: the architecture is relevant and stays.** It is a compiled dataflow graph with
+algebraic data types, evaluated by a typed interpreter: `Spec` is a source program, `compile`
+is the front end, `Plan` is bytecode, and `evaluate`/`rhs` are allocation-free flat loops.
+Rewriting toward OO/vtables, a dynamic-storage ECS or a JIT would add complexity and failure
+modes without buying measurable speed at this scale.
+
+The real debt was never the compile/execute split. It was the scalar-only port model, the fixed
+per-component port budget and the global worst-case arrays that made every plan pay for the
+largest one. This extension replaced those with typed wide ports, one source of truth for
+placement, transforms as ordinary graph nodes, and caller-provided exact storage. Physically
+reordering nodes into execution order, fusing outputs with derivatives, and a lean `release`
+evaluation path remain deferred until a 3D profile justifies them.
+
 ## 3. Decisions
 
 ### D1. Components are plain `f64` functions; no generic scalar, no automatic differentiation
@@ -233,11 +248,14 @@ an external that an analysis solves for.
 | Newton | `src/core/solve/newton.zig` | linear and nonlinear roots, singular/bounded/divergent probes, step limit, bit-identical determinism |
 | Trim | `src/analysis/trim.zig` | level-flight lift/thrust balance, flight-condition binding, validity propagation, determinism |
 | Envelope | `src/analysis/envelope.zig` | glider terminal speed, thrust and lift limits, sweep symmetry, bit-reproducible ordering |
-| Fuzz | `test/fuzz_model.zig` | random valid and invalid architectures: compile never crashes, plans are sound, evaluation is total; checks that its own generator reaches each error class |
-| Style | `test/tidy.zig` | the rules in `TIGER_STYLE.md` |
+| Fuzz | `test/fuzz_model.zig` | random valid and invalid architectures: compile never crashes, plans are sound, evaluation is total; generates placements, vector/wrench ports, cross-frame and rigid wires, and checks that its generator reaches every reachable error class |
+| Style | `test/tidy.zig` | the rules in `TIGER_STYLE.md`, including the reserved `__x_` generated-node prefix |
 
 The fuzzer has run 800 000 random architectures across several seeds in ReleaseSafe
-(about 110 000 compiled into plans) without a failure.
+(about 110 000 compiled into plans) without a failure. Two compiler errors are intentionally
+outside its reach: `BodyHasNoAttitude` (the closed kind set has no body without an attitude
+output) and `TooManyGeneratedNodes` (64 connections cannot exceed the `u16` ceiling). They stay
+as defensive checks in `compile.zig`.
 
 ## 6. Status and roadmap
 
@@ -250,7 +268,9 @@ component `Context`, generated cross-frame vector transforms, and single-wire ri
 post-step normalization (Phase 4); local-frame aero with `airflow` stations, `wing` linear and
 polar-table models, and thruster wrenches for rigid attachment (Phase 5); a damped Newton
 solver and reduced level-flight trim (Phase 6); directional envelope with a glider terminal-velocity
-case, thrust/lift limits and a deterministic sweep driver (Phase 7).
+case, thrust/lift limits and a deterministic sweep driver (Phase 7); a fuzzer that generates
+placements, frames and rigid attachments and asserts error-class coverage, plus a style rule that
+protects the generated-node name prefix and the recorded architecture verdict (Phase 8).
 
 Next, roughly in order:
 
@@ -288,6 +308,9 @@ Next, roughly in order:
 - Envelope v1 trims along a single world direction at a time and classifies the limit from the
   final binding values. It scans speed before refining locally, but a disconnected feasible set
   beyond the first gap is not reported. Directions are NED, so a vertical dive is `+z`.
+- The fuzzer's coverage assertions exclude the two defensive compiler errors described in §5;
+  adding a body kind without an attitude, or raising the connection budget near the `u16`
+  ceiling, would make them reachable and should update that list.
 - Tables are piecewise linear (1D and 2D). Smoother interpolation can be added behind the same
   `Lookup` interface.
 - Capacity limits are compile-time constants in `limits.zig`; raising them is a rebuild.

@@ -91,7 +91,7 @@ top-level directory, so adding a GUI or a CLI never disturbs the solver.
 | `src/io/` | planned | spec and result file formats |
 | `src/cli/` | planned | command-line front end |
 | `src/gui/` | planned | desktop graphical front end |
-| `test/` | | architecture fuzzer, style checker |
+| `test/` | | architecture fuzzer (placements, frames, rigid attachments), style checker |
 | `docs/` | | design decisions, style rules, how to add a component |
 
 Core layers depend only downward, and the build graph enforces it: a layer can import only the
@@ -110,4 +110,5 @@ modules it is given in `build.zig`. The same rule is reserved for the planned la
 Early. The skeleton is complete and tested end to end; the physics library is small. See the
 roadmap in `docs/DESIGN.md` for what exists and what is next (mission analysis, optimizer, file
 formats, more components). Trim and directional envelope are available; algebraic loops are
-still rejected by the compiler.
+still rejected by the compiler. The fuzzer covers the 3D placement and frame rules, and the
+style checker protects the compiler's reserved generated-node name prefix.

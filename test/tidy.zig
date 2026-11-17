@@ -9,6 +9,7 @@
 //!   * `TODO` and `FIXME` must carry an issue reference, `TODO(#123)`
 //!   * no dynamic memory in the core (`src/core/`): no allocators, no growable containers
 //!   * layering: a layer imports only the layers below it, and never by relative path
+//!   * the `__x_` prefix is reserved for generated nodes and belongs only to the compiler
 //!
 //! A violation is reported with file and line; all violations are listed before failing.
 
@@ -16,6 +17,14 @@ const std = @import("std");
 
 const max_line_columns = 100;
 const max_fn_lines = 70;
+const reserved_prefix = "__x_";
+
+/// Only the compiler that creates generated names, and this file which describes the rule,
+/// may spell the reserved prefix. Documentation is not scanned by the checker.
+const prefix_owners = [_][]const u8{
+    "src/core/model/compile.zig",
+    "test/tidy.zig",
+};
 
 /// Source directory of each layer and the module names it may import besides `std`.
 ///
@@ -102,6 +111,7 @@ fn checkFile(file: []const u8, text: []const u8, report: *Report) void {
     while (lines.next()) |line| {
         line_no += 1;
         checkLine(file, line_no, line, report);
+        checkReservedPrefix(file, line_no, line, report);
         if (is_core) checkBanned(file, line_no, line, report);
         if (is_src) checkImports(file, line_no, line, report);
         checkFunctionLength(file, line_no, line, &fn_start, report);
@@ -134,6 +144,19 @@ fn checkLine(file: []const u8, n: usize, line: []const u8, report: *Report) void
             report.fail(file, n, "{s} without an issue reference, write {s}(#123)", .{ tag, tag });
         }
     }
+}
+
+/// User-authored names may not start with the compiler's generated-node prefix. Comments may
+/// describe the rule, so only code lines are checked.
+fn checkReservedPrefix(file: []const u8, n: usize, line: []const u8, report: *Report) void {
+    if (isComment(line)) return;
+    if (std.mem.indexOf(u8, line, reserved_prefix) == null) return;
+    for (prefix_owners) |owner| {
+        if (std.mem.eql(u8, file, owner)) return;
+    }
+    report.fail(file, n, "reserved generated-node prefix '{s}' outside the compiler", .{
+        reserved_prefix,
+    });
 }
 
 fn checkBanned(file: []const u8, n: usize, line: []const u8, report: *Report) void {
@@ -232,4 +255,12 @@ test "the checker itself flags what it should" {
     report = .{ .quiet = true };
     checkFile("src/core/base/fake.zig", "//! d\n// TODO fix\nvar a: std.heap.X = 1;\n", &report);
     try std.testing.expectEqual(@as(u32, 2), report.count); // bare TODO, banned heap
+
+    report = .{ .quiet = true };
+    checkFile("src/core/model/fake.zig", "//! d\nconst x = \"__x_0\";\n", &report);
+    try std.testing.expectEqual(@as(u32, 1), report.count); // reserved prefix
+
+    report = .{ .quiet = true };
+    checkFile("src/core/model/compile.zig", "//! d\nconst x = \"__x_0\";\n", &report);
+    try std.testing.expectEqual(@as(u32, 0), report.count); // compiler owns the prefix
 }

@@ -92,6 +92,41 @@ Give `State` fields, give `derivatives`, and decide `feedthrough`:
 `outputs` of a non-feedthrough kind must not read its input: the contract test checks this by
 replacing the inputs with NaN.
 
+## D. Declare a local frame and a placement
+
+Every component works in its own local frame, and its axes are part of the kind's contract. At
+the top of the file state those axes explicitly: for an aero surface, x chord-forward,
+y span-right, z normal-down. Parameters such as areas and offsets are local; do not fold a
+vehicle-level position into them.
+
+The author supplies `ComponentSpec.placement` once per instance: `position_m` is the origin of
+the local frame in the body frame, and `attitude_rad` is its intrinsic Z-Y-X orientation
+relative to the body. The compiler resolves it into `contract.Context.placement`, which `outputs`
+receives. There is no second place to write a position or an orientation. Components that
+consume a station's flow must be given the **same placement** as that station; the compiler
+cannot detect a mismatch, so pin it in a scenario test.
+
+Never write frame math inside a kind. A connection whose source and target frames differ is
+lowered to a generated `frame_transform` node, which is an ordinary node in the plan. The
+exception is a rigid attachment: the compiler derives the mount transform from the source's
+placement for a `.rigid` wire to `body.mount`.
+
+## E. Output vectors, not world coordinates
+
+A kind reports physical quantities in its declared frame, never a global position. Use
+`contract.vec3(dim, quantity, frame)` and `contract.wrench(frame)` for wide ports; the shape
+comes from the field type (`Vec3`, `Quat`, `Wrench`) and is checked against the declaration.
+Body state enters only through the `body` kind, and world conditions enter as externals. An
+`airflow` station, for example, takes body-frame velocity and rate and reports local `alpha`,
+`beta` and `airspeed`; a `wing` takes those scalars and outputs a **local** `wrench`. Neither
+knows where the aircraft is pointed.
+
+To deliver a force to the vehicle, wire the local wrench to `body.mount` once with
+`.attachment = .rigid`. The compiler inserts the rotation and the `r × F` moment. A `vec3`
+cross-frame signal uses a plain `.signal` wire and is rotated automatically; note that velocity
+transforms involving a local frame are rejected because they need the `ω × r` rate shift, which
+an `airflow` station handles instead.
+
 ## Checklist before merging
 
 - [ ] `zig build test` passes in Debug and with `-Doptimize=ReleaseSafe`
@@ -100,4 +135,6 @@ replacing the inputs with NaN.
       outside it
 - [ ] no allocation, no recursion, every loop bounded
 - [ ] names avoid the `__x_` prefix, which is reserved for generated transform nodes
+- [ ] local axes and the placement rule are documented, with a test for a shared station
+- [ ] wide ports declare a frame and output local vectors, not world coordinates
 - [ ] a bug found along the way has its own test

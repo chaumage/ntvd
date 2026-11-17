@@ -9,30 +9,57 @@
 //!     any input, including NaN and infinity.
 //!   * Compilation is deterministic.
 //!
+//! The generator covers scalar signals, wide vector/wrench ports with placements, and
+//! cross-frame and rigid connections that make the compiler insert transform nodes. The
+//! coverage block names every error class the generator can reach; two defensive classes
+//! are intentionally out of reach with the closed kind set (see the comment there).
+//!
 //! Deterministic by construction: the seed and the iteration count are build options, so a
 //! failure is reproduced with `zig build fuzz -Dfuzz-seed=<seed> -Dfuzz-iterations=<n>`.
 //! Pass `-Dfuzz-verbose=true` to print the seed, iteration count and compiled plan count.
 
 const std = @import("std");
 const base = @import("base");
+const components = @import("components");
 const model = @import("model");
 const options = @import("fuzz_options");
 
 const limits = base.limits;
 const Rng = base.Rng;
 const Dim = base.Dim;
+const PortType = components.contract.PortType;
+const Frame = components.contract.Frame;
+const Quantity = components.contract.Quantity;
+const Shape = components.contract.Shape;
 
 const max_comps = 12;
-const max_ext = 6;
+const max_ext = 12;
 const max_conn = 64;
+const max_nodes = max_comps + max_conn;
+const path_len = 32;
 
-const ext_dims = [max_ext]Dim{
-    base.dim.length,
-    base.dim.speed,
-    base.dim.angle,
-    base.dim.force,
-    base.dim.density,
-    base.dim.dimensionless,
+/// One external definition. A local-frame vector deliberately has no owning component and is
+/// rejected only when it is used in a connection.
+const ExtDef = struct {
+    dim: Dim,
+    shape: Shape = .scalar,
+    quantity: Quantity = .scalar,
+    frame: Frame = .none,
+};
+
+const ext_defs = [max_ext]ExtDef{
+    .{ .dim = base.dim.length },
+    .{ .dim = base.dim.speed },
+    .{ .dim = base.dim.angle },
+    .{ .dim = base.dim.force },
+    .{ .dim = base.dim.density },
+    .{ .dim = base.dim.dimensionless },
+    .{ .dim = base.dim.speed, .shape = .vec3, .quantity = .velocity, .frame = .body },
+    .{ .dim = base.dim.angular_rate, .shape = .vec3, .quantity = .angular_rate, .frame = .body },
+    .{ .dim = base.dim.force, .shape = .vec3, .quantity = .force, .frame = .body },
+    .{ .dim = .{}, .shape = .quat, .quantity = .quaternion, .frame = .body },
+    .{ .dim = base.dim.force, .shape = .vec3, .quantity = .force, .frame = .world },
+    .{ .dim = base.dim.force, .shape = .vec3, .quantity = .force, .frame = .local },
 };
 
 /// All storage of one generated spec. The `Spec` only borrows from it.
@@ -42,8 +69,8 @@ const Generated = struct {
     connections: [max_conn]model.ConnectionSpec = undefined,
     comp_names: [max_comps][8]u8 = undefined,
     ext_names: [max_ext][8]u8 = undefined,
-    from_text: [max_conn][24]u8 = undefined,
-    to_text: [max_conn][24]u8 = undefined,
+    from_text: [max_conn][path_len]u8 = undefined,
+    to_text: [max_conn][path_len]u8 = undefined,
     n_comps: u32 = 0,
     n_ext: u32 = 0,
     n_conn: u32 = 0,
@@ -57,14 +84,43 @@ const Generated = struct {
     }
 };
 
+fn bodyModel(rng: *Rng) model.Component {
+    return .{ .body = .{ .six_dof = .{
+        .mass_kg = rng.range(0.1, 10.0),
+        .inertia_kg_m2 = .{ .x = 1.0, .y = 2.0, .z = 2.0 },
+    } } };
+}
+
+fn wingModel(rng: *Rng) model.Component {
+    return .{ .wing = .{ .linear = .{
+        .area_m2 = rng.range(0.1, 10.0),
+        .aspect_ratio = rng.range(1.0, 12.0),
+        .cl_alpha_per_rad = rng.range(3.0, 6.0),
+        .cd0 = rng.range(0.0, 0.1),
+        .oswald = rng.range(0.5, 1.0),
+        .alpha_stall_rad = rng.range(0.1, 0.4),
+    } } };
+}
+
+fn transformModel(rng: *Rng) model.Component {
+    return .{ .frame_transform = .{ .apply = .{
+        .mode = if (rng.below(2) == 0) .rotate else .mount,
+        .dynamic = switch (rng.below(3)) {
+            0 => .none,
+            1 => .direct,
+            else => .conjugate,
+        },
+    } } };
+}
+
 fn randomComponent(rng: *Rng) model.Component {
     // Parameters are mostly sane, sometimes deliberately invalid.
     const sane = rng.below(10) != 0;
     const positive = if (sane) rng.range(0.1, 10.0) else rng.range(-5.0, 0.0);
-    return switch (rng.below(5)) {
-        0 => .{ .air = .{ .isa = .{ .delta_t_k = rng.range(-20.0, 20.0) } } },
-        1 => .{ .gain = .{ .linear = .{ .k = rng.range(-3.0, 3.0) } } },
-        2 => .{ .lift_surface = .{ .linear = .{
+    return switch (rng.below(100)) {
+        0...14 => .{ .air = .{ .isa = .{ .delta_t_k = rng.range(-20.0, 20.0) } } },
+        15...29 => .{ .gain = .{ .linear = .{ .k = rng.range(-3.0, 3.0) } } },
+        30...49 => .{ .lift_surface = .{ .linear = .{
             .area_m2 = positive,
             .aspect_ratio = rng.range(1.0, 12.0),
             .cl_alpha_per_rad = rng.range(3.0, 6.0),
@@ -72,43 +128,181 @@ fn randomComponent(rng: *Rng) model.Component {
             .oswald = rng.range(0.5, 1.0),
             .alpha_stall_rad = rng.range(0.1, 0.4),
         } } },
-        3 => .{ .thruster = .{ .linear_decay = .{
+        50...64 => .{ .thruster = .{ .linear_decay = .{
             .static_thrust_n = positive,
             .max_speed_ms = rng.range(10.0, 80.0),
         } } },
-        else => .{ .point_mass = .{ .rigid = .{ .mass_kg = positive } } },
+        65...83 => .{ .point_mass = .{ .rigid = .{ .mass_kg = positive } } },
+        84...89 => bodyModel(rng),
+        90...93 => .{ .airflow = .{ .station = .{} } },
+        94...96 => wingModel(rng),
+        97...98 => .{ .load = .{ .point = .{} } },
+        else => transformModel(rng),
     };
 }
 
-/// A source (external or component output) of the given dimension, or null if none exists.
-fn pickSource(g: *Generated, rng: *Rng, dim: Dim, out: *[24]u8) ?[]const u8 {
-    var candidates: [max_comps * limits.max_ports + max_ext][]const u8 = undefined;
+/// Mostly finite; a rare non-finite placement must produce `BadPlacement` at compile time.
+fn randomPlacement(rng: *Rng) model.Placement {
+    if (rng.below(60) == 0) return .{ .position_m = .{ .x = std.math.nan(f64) } };
+    return .{
+        .position_m = .{
+            .x = rng.range(-2.0, 2.0),
+            .y = rng.range(-2.0, 2.0),
+            .z = rng.range(-2.0, 2.0),
+        },
+        .attitude_rad = .{
+            .x = rng.range(-0.5, 0.5),
+            .y = rng.range(-0.5, 0.5),
+            .z = rng.range(-3.2, 3.2),
+        },
+    };
+}
+
+const SourceChoice = enum { compatible, wrong_dimension, any };
+const Source = struct { text: []const u8, ptype: PortType };
+
+fn matches(pt: PortType, want: PortType, mode: SourceChoice) bool {
+    return switch (mode) {
+        .compatible => components.contract.compatibility(pt, want) == null,
+        .wrong_dimension => pt.shape == want.shape and pt.quantity == want.quantity and
+            pt.frame == want.frame and !pt.dim.eql(want.dim),
+        .any => true,
+    };
+}
+
+/// A source (external or component output) for `want`. A wrong-dimension request falls back
+/// to a compatible source if no candidate has that exact shape, quantity and frame.
+fn pickSource(
+    g: *const Generated,
+    rng: *Rng,
+    want: PortType,
+    mode: SourceChoice,
+    out: *[path_len]u8,
+) ?Source {
+    const cap = max_comps * limits.max_ports + max_ext;
+    var texts: [cap][]const u8 = undefined;
+    var types: [cap]PortType = undefined;
+    var scratch: [cap][path_len]u8 = undefined;
     var n: usize = 0;
-    var scratch: [max_comps * limits.max_ports + max_ext][24]u8 = undefined;
 
     for (g.externals[0..g.n_ext]) |e| {
-        if (e.dim.eql(dim)) {
-            candidates[n] = e.name;
-            n += 1;
-        }
+        texts[n] = e.name;
+        types[n] = .{
+            .dim = e.dim,
+            .shape = e.shape,
+            .quantity = e.quantity,
+            .frame = e.frame,
+        };
+        n += 1;
     }
     for (g.components[0..g.n_comps]) |c| {
         for (c.component.signature().outputs) |port| {
-            if (!port.ptype.dim.eql(dim)) continue;
-            const text = std.fmt.bufPrint(&scratch[n], "{s}.{s}", .{
+            texts[n] = std.fmt.bufPrint(&scratch[n], "{s}.{s}", .{
                 c.name, port.name,
             }) catch unreachable;
-            candidates[n] = text;
+            types[n] = port.ptype;
             n += 1;
         }
     }
     if (n == 0) return null;
-    const chosen = candidates[rng.below(@intCast(n))];
+
+    const chosen = choose(rng, &texts, &types, want, mode, n) orelse
+        choose(rng, &texts, &types, want, .compatible, n) orelse return null;
+    @memcpy(out[0..chosen.text.len], chosen.text);
+    return .{ .text = out[0..chosen.text.len], .ptype = chosen.ptype };
+}
+
+fn choose(
+    rng: *Rng,
+    texts: []const []const u8,
+    types: []const PortType,
+    want: PortType,
+    mode: SourceChoice,
+    n: usize,
+) ?Source {
+    var count: usize = 0;
+    for (texts[0..n], types[0..n]) |_, pt| {
+        if (matches(pt, want, mode)) count += 1;
+    }
+    if (count == 0) return null;
+    var target = rng.below(@intCast(count));
+    for (texts[0..n], types[0..n]) |text, pt| {
+        if (!matches(pt, want, mode)) continue;
+        if (target == 0) return .{ .text = text, .ptype = pt };
+        target -= 1;
+    }
+    unreachable;
+}
+
+const WrenchSource = struct { text: []const u8, component: u16 };
+
+/// A component's local wrench output, used as a rigid attachment source.
+fn pickWrenchSource(g: *const Generated, rng: *Rng, out: *[path_len]u8) ?WrenchSource {
+    var owners: [max_comps]u16 = undefined;
+    var names: [max_comps][]const u8 = undefined;
+    var n: usize = 0;
+    for (g.components[0..g.n_comps], 0..) |c, ci| {
+        for (c.component.signature().outputs) |port| {
+            if (port.ptype.shape != .wrench or port.ptype.frame != .local) continue;
+            owners[n] = @intCast(ci);
+            names[n] = port.name;
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    const i = rng.below(@intCast(n));
+    const text = std.fmt.bufPrint(out, "{s}.{s}", .{
+        g.components[owners[i]].name, names[i],
+    }) catch unreachable;
+    return .{ .text = text, .component = owners[i] };
+}
+
+/// A non-mount input, used as an invalid rigid attachment target.
+fn pickNonMountInput(g: *const Generated, rng: *Rng, out: *[path_len]u8) ?[]const u8 {
+    var texts: [max_comps * limits.max_ports][]const u8 = undefined;
+    var scratch: [max_comps * limits.max_ports][path_len]u8 = undefined;
+    var n: usize = 0;
+    for (g.components[0..g.n_comps]) |c| {
+        const sig = c.component.signature();
+        for (sig.inputs) |port| {
+            if (std.mem.eql(u8, port.name, "mount") and port.ptype.shape == .wrench) continue;
+            texts[n] = std.fmt.bufPrint(&scratch[n], "{s}.{s}", .{
+                c.name, port.name,
+            }) catch unreachable;
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    const chosen = texts[rng.below(@intCast(n))];
     @memcpy(out[0..chosen.len], chosen);
     return out[0..chosen.len];
 }
 
-fn addConnection(g: *Generated, from: []const u8, to: []const u8, gain: f64) void {
+fn findBody(g: *const Generated) ?u16 {
+    for (g.components[0..g.n_comps], 0..) |c, ci| {
+        const sig = c.component.signature();
+        const mi = sig.inputIndex("mount") orelse continue;
+        if (sig.inputs[mi].ptype.shape == .wrench) return @intCast(ci);
+    }
+    return null;
+}
+
+fn addConnection(
+    g: *Generated,
+    from: []const u8,
+    to: []const u8,
+    gain: f64,
+) void {
+    addAttachment(g, from, to, .signal, gain);
+}
+
+fn addAttachment(
+    g: *Generated,
+    from: []const u8,
+    to: []const u8,
+    kind: model.Attachment,
+    gain: f64,
+) void {
     if (g.n_conn == max_conn) return;
     const i = g.n_conn;
     @memcpy(g.from_text[i][0..from.len], from);
@@ -117,25 +311,48 @@ fn addConnection(g: *Generated, from: []const u8, to: []const u8, gain: f64) voi
         .from = g.from_text[i][0..from.len],
         .to = g.to_text[i][0..to.len],
         .gain = gain,
+        .attachment = kind,
     };
     g.n_conn += 1;
 }
 
-fn generate(g: *Generated, rng: *Rng) void {
-    g.* = .{};
+fn generateExternals(g: *Generated, rng: *Rng) void {
     g.n_ext = 1 + rng.below(max_ext);
     for (0..g.n_ext) |i| {
         const name = std.fmt.bufPrint(&g.ext_names[i], "e{d}", .{i}) catch unreachable;
-        g.externals[i] = .{ .name = name, .dim = ext_dims[i] };
+        const def = ext_defs[i];
+        g.externals[i] = .{
+            .name = name,
+            .dim = def.dim,
+            .shape = def.shape,
+            .quantity = def.quantity,
+            .frame = def.frame,
+        };
     }
+}
+
+fn forceAmbiguousBodies(g: *Generated, rng: *Rng) void {
+    if (g.n_comps < 2 or rng.below(30) != 0) return;
+    for (0..2) |i| {
+        g.components[i].component = bodyModel(rng);
+        g.components[i].placement = .{};
+    }
+}
+
+fn generateComponents(g: *Generated, rng: *Rng) void {
     g.n_comps = rng.below(max_comps + 1);
     for (0..g.n_comps) |i| {
         const name = std.fmt.bufPrint(&g.comp_names[i], "c{d}", .{i}) catch unreachable;
-        g.components[i] = .{ .name = name, .component = randomComponent(rng) };
+        g.components[i] = .{
+            .name = name,
+            .component = randomComponent(rng),
+            .placement = randomPlacement(rng),
+        };
     }
+    forceAmbiguousBodies(g, rng);
+}
 
-    // Wire the inputs of every component: mostly compatible, sometimes missing, doubled or
-    // nonsensical, so that every error class is exercised.
+fn wireInputs(g: *Generated, rng: *Rng) void {
     for (g.components[0..g.n_comps]) |c| {
         for (c.component.signature().inputs) |port| {
             const copies: u32 = switch (rng.below(20)) {
@@ -144,32 +361,100 @@ fn generate(g: *Generated, rng: *Rng) void {
                 else => 1,
             };
             for (0..copies) |_| {
-                var buf: [24]u8 = undefined;
-                var to_buf: [24]u8 = undefined;
+                var buf: [path_len]u8 = undefined;
+                var to_buf: [path_len]u8 = undefined;
                 const to = std.fmt.bufPrint(&to_buf, "{s}.{s}", .{
                     c.name, port.name,
                 }) catch unreachable;
-                // Occasionally wire a source of a different (but existing) dimension.
-                const dim = if (rng.below(15) == 0)
-                    ext_dims[rng.below(max_ext)]
+                const mode: SourceChoice = if (rng.below(15) == 0)
+                    .wrong_dimension
                 else
-                    port.ptype.dim;
-                const from = pickSource(g, rng, dim, &buf) orelse continue;
-                const gain: f64 = if (rng.below(2) == 0) 1.0 else -1.0;
-                addConnection(g, from, to, gain);
+                    .compatible;
+                const src = pickSource(g, rng, port.ptype, mode, &buf) orelse continue;
+                addConnection(g, src.text, to, if (rng.below(2) == 0) 1.0 else -1.0);
             }
         }
     }
-    if (rng.below(25) == 0) addConnection(g, "nowhere", "c0.x", 1.0);
+}
+
+/// Rigid attachments exercise the mount transform and its five error classes. The source is
+/// sometimes a non-wrench signal, the target sometimes a non-mount input or a missing body.
+fn addRigidAttachments(g: *Generated, rng: *Rng) void {
+    if (rng.below(8) != 0) return;
+    var from_buf: [path_len]u8 = undefined;
+    var to_buf: [path_len]u8 = undefined;
+
+    var source: []const u8 = undefined;
+    if (rng.below(10) != 0) {
+        const wrench = pickWrenchSource(g, rng, &from_buf) orelse return;
+        if (rng.below(5) == 0) {
+            // A bad placement on the source must be reported as `BadPlacement`.
+            g.components[wrench.component].placement.position_m.y = std.math.nan(f64);
+        }
+        source = wrench.text;
+    } else {
+        const dummy: PortType = .{ .dim = base.dim.dimensionless };
+        source = (pickSource(g, rng, dummy, .any, &from_buf) orelse return).text;
+    }
+
+    const body = findBody(g);
+    if (body != null and rng.below(3) == 0) {
+        to_buf = undefined;
+        const target = pickNonMountInput(g, rng, &to_buf) orelse return;
+        addAttachment(g, source, target, .rigid, 1.0);
+        return;
+    }
+    const name = if (body) |bi| g.components[bi].name else "c0";
+    const target = std.fmt.bufPrint(&to_buf, "{s}.mount", .{name}) catch unreachable;
+    addAttachment(g, source, target, .rigid, 1.0);
+}
+
+fn addBadPaths(g: *Generated, rng: *Rng) void {
+    if (rng.below(10) != 0) return;
+    switch (rng.below(4)) {
+        0 => addConnection(g, "", "c0.x", 1.0),
+        1 => addConnection(g, "a.", "c0.x", 1.0),
+        2 => addConnection(g, "e0", "", 1.0),
+        else => addConnection(g, "nowhere", "c0.x", 1.0),
+    }
+}
+
+/// A small, otherwise-valid spec with one deliberate rigid-attachment fault. The main
+/// generator rarely reaches these errors because its many components often fail validation
+/// first; this probe makes their coverage independent of that competition.
+fn generateRigidProbe(g: *Generated, rng: *Rng) void {
+    g.n_ext = 1;
+    g.externals[0] = .{ .name = "e0", .dim = base.dim.dimensionless };
+    g.components[0] = .{ .name = "c0", .component = bodyModel(rng), .placement = .{} };
+    g.components[1] = .{ .name = "c1", .component = wingModel(rng), .placement = .{} };
+    g.n_comps = 2;
+    if (rng.below(2) == 0) {
+        addAttachment(g, "e0", "c0.mount", .rigid, 1.0);
+    } else {
+        addAttachment(g, "c1.wrench", "c1.alpha", .rigid, 1.0);
+    }
+}
+
+fn generate(g: *Generated, rng: *Rng) void {
+    g.* = .{};
+    if (rng.below(8) == 0) {
+        generateRigidProbe(g, rng);
+        return;
+    }
+    generateExternals(g, rng);
+    generateComponents(g, rng);
+    wireInputs(g, rng);
+    addRigidAttachments(g, rng);
+    addBadPaths(g, rng);
 }
 
 fn checkPlan(plan: *const model.Plan, rng: *Rng) !void {
     const allocator = std.testing.allocator;
     const n = plan.n_nodes;
 
-    // The order is a permutation.
-    var position: [max_comps]u32 = undefined;
-    var seen: [max_comps]bool = @splat(false);
+    // The order is a permutation, including generated transform nodes.
+    var position: [max_nodes]u32 = undefined;
+    var seen: [max_nodes]bool = @splat(false);
     for (plan.order[0..n], 0..) |ni, pos| {
         try std.testing.expect(ni < n and !seen[ni]);
         seen[ni] = true;
@@ -272,6 +557,16 @@ const ErrorCounts = struct {
     }
 };
 
+fn printSummary(compiled: u32, seen: *const ErrorCounts) void {
+    std.debug.print(
+        "fuzz: seed=0x{x} iterations={d} compiled={d}\n",
+        .{ options.seed, options.iterations, compiled },
+    );
+    for (seen.names[0..seen.len], seen.counts[0..seen.len]) |name, count| {
+        std.debug.print("  {s}: {d}\n", .{ name, count });
+    }
+}
+
 test "random architectures: compile is total and plans are sound" {
     const allocator = std.testing.allocator;
     var rng = Rng.init(options.seed);
@@ -319,13 +614,17 @@ test "random architectures: compile is total and plans are sound" {
         }
     }
 
-    // The generator must actually reach both sides: plans worth checking, and the errors
-    // the compiler is meant to catch.
+    // The generator must reach both sides: plans worth checking and the errors the compiler
+    // is meant to catch. `BodyHasNoAttitude` and `TooManyGeneratedNodes` are defensive paths:
+    // the closed kind set has no body without an attitude output, and 64 connections cannot
+    // exceed the u16 generated-node ceiling. They are not fuzz-reachable by construction.
     if (options.iterations >= 1000) {
         try std.testing.expect(compiled > options.iterations / 20);
         for ([_]model.CompileError{
-            error.DimensionMismatch, error.UnconnectedInput, error.MultiplyDriven,
-            error.AlgebraicLoop,     error.InvalidParameter, error.UnknownExternal,
+            error.DimensionMismatch, error.UnconnectedInput,         error.MultiplyDriven,
+            error.AlgebraicLoop,     error.InvalidParameter,         error.UnknownExternal,
+            error.BadPlacement,      error.BadPath,                  error.FrameMismatch,
+            error.AmbiguousBody,     error.RigidAttachmentNotWrench, error.RigidAttachmentToNonBody,
         }) |expected| {
             if (seen_errors.count(expected) == 0) {
                 std.debug.print("fuzzer never produced {s}\n", .{@errorName(expected)});
@@ -333,10 +632,5 @@ test "random architectures: compile is total and plans are sound" {
             }
         }
     }
-    if (options.verbose) {
-        std.debug.print(
-            "fuzz: seed=0x{x} iterations={d} compiled={d}\n",
-            .{ options.seed, options.iterations, compiled },
-        );
-    }
+    if (options.verbose) printSummary(compiled, &seen_errors);
 }
