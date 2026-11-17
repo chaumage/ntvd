@@ -9,10 +9,11 @@
 //!   base        L0   dimensions, tables, linear algebra, rng           (std only)
 //!   components  L1   component contract and physical models            (base)
 //!   model       L2   architecture spec -> validated, compiled plan     (base, components)
-//!   solve       L3   time integration, (later) Newton                  (base, model)
+//!   solve       L3   time integration, damped Newton                   (base, model)
+//!   analysis    L4   steady-flight trim                                (base, model, solve)
 //!
-//! The directories `src/{analysis,optimize,io,cli,gui}/` are reserved for layers that will
-//! sit above the core solver. They are not built yet; see their READMEs for the plan.
+//! The directories `src/{optimize,io,cli,gui}/` are reserved for layers that will sit above
+//! the core solver. They are not built yet; see their READMEs for the plan.
 //!
 //! Steps
 //!   zig build test    all unit, property, fuzz and tidy tests
@@ -52,6 +53,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "base", .module = base },
         .{ .name = "model", .module = model },
     });
+    const analysis = addLayer(b, "analysis", "src/analysis/root.zig", target, optimize, &.{
+        .{ .name = "base", .module = base },
+        .{ .name = "model", .module = model },
+        .{ .name = "solve", .module = solve },
+    });
 
     const test_step = b.step("test", "Run all tests");
     const check_step = b.step("check", "Compile everything without running");
@@ -59,7 +65,7 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run the architecture fuzzer");
 
     // Per-layer unit tests.
-    const layers = [_]*std.Build.Module{ base, components, model, solve };
+    const layers = [_]*std.Build.Module{ base, components, model, solve, analysis };
     for (layers) |layer| {
         const unit = b.addTest(.{ .root_module = layer, .filters = filters });
         check_step.dependOn(&unit.step);

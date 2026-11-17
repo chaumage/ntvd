@@ -526,3 +526,131 @@ test "the 3D aircraft stays total under non-finite inputs" {
         }
     }
 }
+
+/// A gravity-on aircraft for trim: two symmetric wings, an axial thruster and fixed air.
+/// The trim analysis binds alpha to the body velocity and attitude states, leaving throttle as
+/// the one control external. Parameters are chosen so the level-flight equilibrium is inside
+/// the linear wing envelope and the throttle is mid-range.
+pub const trim_aircraft = struct {
+    pub const mass_kg = 50.0;
+    pub const area_m2 = 1.2;
+    pub const aspect_ratio = 8.0;
+    pub const cl_alpha_per_rad = 5.0;
+    pub const cd0 = 0.02;
+    pub const oswald = 0.9;
+    pub const alpha_stall_rad = 0.3;
+    pub const static_thrust_n = 200.0;
+    pub const max_speed_ms = 60.0;
+    pub const density = 1.225;
+    pub const speed_ms = 20.0;
+    pub const gravity_m_s2 = base.units.g0;
+
+    pub const externals = [_]spec_mod.ExternalSpec{
+        .{ .name = "altitude", .dim = base.dim.length },
+        .{ .name = "throttle", .dim = base.dim.dimensionless },
+    };
+
+    pub fn wingModel() components_mod.wing.Model {
+        return .{ .linear = .{
+            .area_m2 = area_m2,
+            .aspect_ratio = aspect_ratio,
+            .cl_alpha_per_rad = cl_alpha_per_rad,
+            .cd0 = cd0,
+            .oswald = oswald,
+            .alpha_stall_rad = alpha_stall_rad,
+        } };
+    }
+
+    pub fn components() [8]spec_mod.ComponentSpec {
+        const left: spec_mod.Placement = .{ .position_m = .{ .y = 1.0 } };
+        const right: spec_mod.Placement = .{ .position_m = .{ .y = -1.0 } };
+        return .{
+            .{ .name = "body", .component = .{ .body = .{ .six_dof = .{
+                .mass_kg = mass_kg,
+                .inertia_kg_m2 = .{ .x = 2.0, .y = 3.0, .z = 4.0 },
+            } } } },
+            .{
+                .name = "air",
+                .component = .{ .air = .{ .fixed = .{
+                    .density_kg_m3 = density,
+                    .speed_of_sound_ms = 340.0,
+                } } },
+            },
+            .{
+                .name = "left_station",
+                .component = .{ .airflow = .{ .station = .{} } },
+                .placement = left,
+            },
+            .{ .name = "left_wing", .component = .{ .wing = wingModel() }, .placement = left },
+            .{
+                .name = "right_station",
+                .component = .{ .airflow = .{ .station = .{} } },
+                .placement = right,
+            },
+            .{ .name = "right_wing", .component = .{ .wing = wingModel() }, .placement = right },
+            .{ .name = "nose_station", .component = .{ .airflow = .{ .station = .{} } } },
+            .{
+                .name = "motor",
+                .component = .{ .thruster = .{ .linear_decay = .{
+                    .static_thrust_n = static_thrust_n,
+                    .max_speed_ms = max_speed_ms,
+                } } },
+            },
+        };
+    }
+
+    pub const connections = [_]spec_mod.ConnectionSpec{
+        .{ .from = "altitude", .to = "air.altitude" },
+        .{ .from = "body.velocity_body", .to = "left_station.velocity_body" },
+        .{ .from = "body.rate_body", .to = "left_station.rate_body" },
+        .{ .from = "body.velocity_body", .to = "right_station.velocity_body" },
+        .{ .from = "body.rate_body", .to = "right_station.rate_body" },
+        .{ .from = "body.velocity_body", .to = "nose_station.velocity_body" },
+        .{ .from = "body.rate_body", .to = "nose_station.rate_body" },
+        .{ .from = "left_station.alpha", .to = "left_wing.alpha" },
+        .{ .from = "left_station.beta", .to = "left_wing.beta" },
+        .{ .from = "left_station.airspeed", .to = "left_wing.airspeed" },
+        .{ .from = "right_station.alpha", .to = "right_wing.alpha" },
+        .{ .from = "right_station.beta", .to = "right_wing.beta" },
+        .{ .from = "right_station.airspeed", .to = "right_wing.airspeed" },
+        .{ .from = "air.density", .to = "left_wing.density" },
+        .{ .from = "air.density", .to = "right_wing.density" },
+        .{ .from = "nose_station.airspeed", .to = "motor.airspeed" },
+        .{ .from = "throttle", .to = "motor.throttle" },
+        .{ .from = "left_wing.wrench", .to = "body.mount", .attachment = .rigid },
+        .{ .from = "right_wing.wrench", .to = "body.mount", .attachment = .rigid },
+        .{ .from = "motor.wrench", .to = "body.mount", .attachment = .rigid },
+    };
+
+    pub fn spec(comps: *const [8]spec_mod.ComponentSpec) Spec {
+        return .{ .components = comps, .externals = &externals, .connections = &connections };
+    }
+
+    pub const Forces = struct {
+        lift: f64,
+        drag: f64,
+        thrust: f64,
+    };
+
+    /// Per-wing lift and drag, and total thrust, at a given alpha and throttle.
+    pub fn forces(alpha: f64, throttle: f64) Forces {
+        const q_s = 0.5 * density * speed_ms * speed_ms * area_m2;
+        const cl = cl_alpha_per_rad * alpha;
+        const cd = cd0 + cl * cl / (std.math.pi * oswald * aspect_ratio);
+        return .{
+            .lift = q_s * cl,
+            .drag = q_s * cd,
+            .thrust = throttle * static_thrust_n * (1.0 - speed_ms / max_speed_ms),
+        };
+    }
+
+    /// Body-frame velocity derivatives when pitch equals alpha and rate is zero.
+    pub fn balance(alpha: f64, throttle: f64) base.Vec3 {
+        const f = forces(alpha, throttle);
+        return .{
+            .x = (f.thrust - 2.0 * f.drag) / mass_kg - gravity_m_s2 * @sin(alpha),
+            .y = 0.0,
+            .z = -2.0 * f.lift / mass_kg + gravity_m_s2 * @cos(alpha),
+        };
+    }
+};

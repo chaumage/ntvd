@@ -19,9 +19,9 @@ const max_fn_lines = 70;
 
 /// Source directory of each layer and the module names it may import besides `std`.
 ///
-/// The core layers under `src/core/` are built today. The directories after them are
-/// reserved for layers above the core solver; the same import rules will apply as soon as
-/// they contain Zig code.
+/// The core layers under `src/core/` and `src/analysis/` are built today. The remaining
+/// directories are reserved for layers above the core solver; the same import rules will
+/// apply as soon as they contain Zig code.
 const layers = [_]struct { dir: []const u8, may_import: []const []const u8 }{
     .{ .dir = "src/core/base/", .may_import = &.{} },
     .{ .dir = "src/core/components/", .may_import = &.{"base"} },

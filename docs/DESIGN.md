@@ -21,8 +21,10 @@ Out of scope for the core: user interface, file formats, plotting. They are shel
 ## 2. Layers
 
 ```
+src/analysis/           steady analyses (built today)
+  L4  analysis      trim; (planned) envelope, mission segments
 src/core/               the solver (built today)
-  L3  solve        time integration; (planned) Newton, trim, algebraic loops
+  L3  solve        time integration, damped Newton; (planned) algebraic loops
   L2  model        Spec -> compile -> Plan (+ Workspace)
   L1  components   contract + kinds (air, airflow, body, gain, lift_surface, wing, ...)
   L0  base         dim, units, geometry, validity, tables, linalg, rng, atmosphere, limits
@@ -37,9 +39,9 @@ They are normative: a component author picks up its local axes from there. Its g
 rows are pinned by tests in `src/core/base/geometry.zig`; the document says where the rest are
 pinned as the corresponding phases land.
 
-Planned above L3, each with its own directory under `src/`: `analysis/` (trim, sweeps,
-missions), `optimize/`, `io/`, `cli/`, `gui/`, and eventually a C ABI. They are empty except
-for a README until the solver work that motivates them lands.
+`src/analysis/` now holds trim; envelope sweeps and mission segments will join it. Planned
+above it, each with its own directory under `src/`: `optimize/`, `io/`, `cli/`, `gui/`, and
+eventually a C ABI. They are empty except for a README until the work that motivates them lands.
 
 ## 3. Decisions
 
@@ -203,9 +205,10 @@ today. The same input gives bit-identical output, so every failure reproduces fr
 ### D9. Algebraic loops are rejected for now
 
 Feedthrough components feeding each other in a cycle are reported (`AlgebraicLoop`, naming
-the components). Planned: route them to the nonlinear solver as unknowns. Until then, break
-the loop with a dynamic component or turn the loop variable into an external that an analysis
-solves for.
+the components). The damped Newton solver can now solve residual systems, but the compiler
+still rejects loops: routing them through it needs a safe choice of unknowns and residuals per
+topology. Until then, break the loop with a dynamic component or turn the loop variable into
+an external that an analysis solves for.
 
 ## 4. How fidelity evolves on a real project
 
@@ -226,6 +229,8 @@ solves for.
 | Contract property | `contract.expectKindContract` | every model of every kind: finite, deterministic, feedthrough honest |
 | Scenario | `src/core/model/scenarios.zig` | physical loop compiles; model swap leaves wiring identical; totality under NaN/inf |
 | Dynamics | `src/core/solve/integrate.zig` | RK4 vs analytic terminal-velocity solution; measured 4th-order convergence; divergence handling |
+| Newton | `src/core/solve/newton.zig` | linear and nonlinear roots, singular/bounded/divergent probes, step limit, bit-identical determinism |
+| Trim | `src/analysis/trim.zig` | level-flight lift/thrust balance, flight-condition binding, validity propagation, determinism |
 | Fuzz | `test/fuzz_model.zig` | random valid and invalid architectures: compile never crashes, plans are sound, evaluation is total; checks that its own generator reaches each error class |
 | Style | `test/tidy.zig` | the rules in `TIGER_STYLE.md` |
 
@@ -241,13 +246,14 @@ conventions and geometry primitives (`Vec3`, `Quat`, `Rotation`); placements in 
 component `Context`, generated cross-frame vector transforms, and single-wire rigid attachment
 (Phase 3); the 6-DOF body with Newton-Euler dynamics, gravity, quaternion kinematics and
 post-step normalization (Phase 4); local-frame aero with `airflow` stations, `wing` linear and
-polar-table models, and thruster wrenches for rigid attachment (Phase 5).
+polar-table models, and thruster wrenches for rigid attachment (Phase 5); a damped Newton
+solver and reduced level-flight trim (Phase 6).
 
 Next, roughly in order:
 
-1. **Newton solver and steady trim** (`solve`, `analysis`): residual form `F(x) = 0`, damped,
-   bounded iterations, structured result (`converged`, `max_iter`, `singular`, `outside
-   envelope`). Then route algebraic loops to it (D9).
+1. **Envelope sweeps** (`analysis`): maximum speed in a direction, grid scans with limiting
+   constraints, and validity maps over the trim solution. Algebraic loops can then be routed
+   to the Newton solver (D9) once their unknowns are chosen.
 2. **Sweeps and mission segments** (climb, cruise, foiling, range): energy and mass closure
    as property tests.
 3. **Optimizer** (`optimize`): design variables bound to spec parameters by path, objectives
@@ -274,6 +280,9 @@ Next, roughly in order:
   Third-party kinds would need a separate C-ABI variant.
 - Time integration is fixed-step explicit RK4 with externals held constant over a step. Stiff
   systems and event handling (touchdown, takeoff) are not covered.
+- Trim v1 solves only symmetric, level, wings-level flight at fixed speed: α and one external
+  against body x/z force derivatives. Side force and moments are assumed zero by symmetry, not
+  solved; full six-residual trim needs independent moment controls.
 - Tables are piecewise linear (1D and 2D). Smoother interpolation can be added behind the same
   `Lookup` interface.
 - Capacity limits are compile-time constants in `limits.zig`; raising them is a rebuild.
