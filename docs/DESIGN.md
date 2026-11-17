@@ -22,7 +22,7 @@ Out of scope for the core: user interface, file formats, plotting. They are shel
 
 ```
 src/analysis/           steady analyses (built today)
-  L4  analysis      trim; (planned) envelope, mission segments
+  L4  analysis      trim, directional envelope; (planned) mission segments
 src/core/               the solver (built today)
   L3  solve        time integration, damped Newton; (planned) algebraic loops
   L2  model        Spec -> compile -> Plan (+ Workspace)
@@ -39,9 +39,10 @@ They are normative: a component author picks up its local axes from there. Its g
 rows are pinned by tests in `src/core/base/geometry.zig`; the document says where the rest are
 pinned as the corresponding phases land.
 
-`src/analysis/` now holds trim; envelope sweeps and mission segments will join it. Planned
-above it, each with its own directory under `src/`: `optimize/`, `io/`, `cli/`, `gui/`, and
-eventually a C ABI. They are empty except for a README until the work that motivates them lands.
+`src/analysis/` now holds trim and directional envelope; mission segments will join them.
+Planned above it, each with its own directory under `src/`: `optimize/`, `io/`, `cli/`, `gui/`,
+and eventually a C ABI. They are empty except for a README until the work that motivates them
+lands.
 
 ## 3. Decisions
 
@@ -231,6 +232,7 @@ an external that an analysis solves for.
 | Dynamics | `src/core/solve/integrate.zig` | RK4 vs analytic terminal-velocity solution; measured 4th-order convergence; divergence handling |
 | Newton | `src/core/solve/newton.zig` | linear and nonlinear roots, singular/bounded/divergent probes, step limit, bit-identical determinism |
 | Trim | `src/analysis/trim.zig` | level-flight lift/thrust balance, flight-condition binding, validity propagation, determinism |
+| Envelope | `src/analysis/envelope.zig` | glider terminal speed, thrust and lift limits, sweep symmetry, bit-reproducible ordering |
 | Fuzz | `test/fuzz_model.zig` | random valid and invalid architectures: compile never crashes, plans are sound, evaluation is total; checks that its own generator reaches each error class |
 | Style | `test/tidy.zig` | the rules in `TIGER_STYLE.md` |
 
@@ -247,15 +249,15 @@ component `Context`, generated cross-frame vector transforms, and single-wire ri
 (Phase 3); the 6-DOF body with Newton-Euler dynamics, gravity, quaternion kinematics and
 post-step normalization (Phase 4); local-frame aero with `airflow` stations, `wing` linear and
 polar-table models, and thruster wrenches for rigid attachment (Phase 5); a damped Newton
-solver and reduced level-flight trim (Phase 6).
+solver and reduced level-flight trim (Phase 6); directional envelope with a glider terminal-velocity
+case, thrust/lift limits and a deterministic sweep driver (Phase 7).
 
 Next, roughly in order:
 
-1. **Envelope sweeps** (`analysis`): maximum speed in a direction, grid scans with limiting
-   constraints, and validity maps over the trim solution. Algebraic loops can then be routed
-   to the Newton solver (D9) once their unknowns are chosen.
-2. **Sweeps and mission segments** (climb, cruise, foiling, range): energy and mass closure
-   as property tests.
+1. **Algebraic loops** (`solve`, `model`): choose unknowns and residuals per topology, then
+   route feedthrough cycles to the Newton solver (D9).
+2. **Mission segments and design studies** (`analysis`): climb, cruise, foiling and range as
+   energy/mass-closed compositions of trim points and envelope points.
 3. **Optimizer** (`optimize`): design variables bound to spec parameters by path, objectives
    and constraints over analysis outputs; Nelder-Mead and CMA-ES first, NSGA-II later.
    Infeasible or `beyond_envelope` points penalized, never NaN.
@@ -280,9 +282,12 @@ Next, roughly in order:
   Third-party kinds would need a separate C-ABI variant.
 - Time integration is fixed-step explicit RK4 with externals held constant over a step. Stiff
   systems and event handling (touchdown, takeoff) are not covered.
-- Trim v1 solves only symmetric, level, wings-level flight at fixed speed: α and one external
-  against body x/z force derivatives. Side force and moments are assumed zero by symmetry, not
-  solved; full six-residual trim needs independent moment controls.
+- Trim v1 solves only symmetric, wings-level flight: α and one external at fixed speed, or α and
+  speed for a glider, against body x/z force derivatives. Side force and moments are assumed zero
+  by symmetry, not solved; full six-residual trim needs independent moment controls.
+- Envelope v1 trims along a single world direction at a time and classifies the limit from the
+  final binding values. It scans speed before refining locally, but a disconnected feasible set
+  beyond the first gap is not reported. Directions are NED, so a vertical dive is `+z`.
 - Tables are piecewise linear (1D and 2D). Smoother interpolation can be added behind the same
   `Lookup` interface.
 - Capacity limits are compile-time constants in `limits.zig`; raising them is a rebuild.

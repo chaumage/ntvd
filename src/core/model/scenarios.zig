@@ -632,16 +632,30 @@ pub const trim_aircraft = struct {
         thrust: f64,
     };
 
-    /// Per-wing lift and drag, and total thrust, at a given alpha and throttle.
+    /// Per-wing lift and drag, and total thrust, at the scenario's reference speed.
     pub fn forces(alpha: f64, throttle: f64) Forces {
-        const q_s = 0.5 * density * speed_ms * speed_ms * area_m2;
+        return .{
+            .lift = wingLift(alpha, speed_ms),
+            .drag = wingDrag(alpha, speed_ms),
+            .thrust = thrust(throttle, speed_ms),
+        };
+    }
+
+    /// Per-wing lift at a given alpha and airspeed.
+    pub fn wingLift(alpha: f64, airspeed_ms: f64) f64 {
+        return 0.5 * density * airspeed_ms * airspeed_ms * area_m2 * cl_alpha_per_rad * alpha;
+    }
+
+    /// Per-wing drag at a given alpha and airspeed.
+    pub fn wingDrag(alpha: f64, airspeed_ms: f64) f64 {
         const cl = cl_alpha_per_rad * alpha;
         const cd = cd0 + cl * cl / (std.math.pi * oswald * aspect_ratio);
-        return .{
-            .lift = q_s * cl,
-            .drag = q_s * cd,
-            .thrust = throttle * static_thrust_n * (1.0 - speed_ms / max_speed_ms),
-        };
+        return 0.5 * density * airspeed_ms * airspeed_ms * area_m2 * cd;
+    }
+
+    /// Available thrust at a throttle setting and airspeed.
+    pub fn thrust(throttle: f64, airspeed_ms: f64) f64 {
+        return throttle * static_thrust_n * (1.0 - airspeed_ms / max_speed_ms);
     }
 
     /// Body-frame velocity derivatives when pitch equals alpha and rate is zero.
@@ -652,5 +666,104 @@ pub const trim_aircraft = struct {
             .y = 0.0,
             .z = -2.0 * f.lift / mass_kg + gravity_m_s2 * @cos(alpha),
         };
+    }
+};
+
+/// An unpowered aircraft for envelope tests: two symmetric wings, fixed air and gravity.
+/// The two wings share `area_m2` equally, so `forces` and `terminalSpeed` use total area.
+pub const glider = struct {
+    pub const mass_kg = 12.0;
+    pub const area_m2 = 1.0;
+    pub const aspect_ratio = 8.0;
+    pub const cl_alpha_per_rad = 5.0;
+    pub const cd0 = 0.05;
+    pub const oswald = 0.9;
+    pub const alpha_stall_rad = 0.3;
+    pub const density = 1.225;
+    pub const gravity_m_s2 = base.units.g0;
+
+    pub const externals = [_]spec_mod.ExternalSpec{
+        .{ .name = "altitude", .dim = base.dim.length },
+    };
+
+    pub fn wingModel() components_mod.wing.Model {
+        return .{ .linear = .{
+            .area_m2 = area_m2 / 2.0,
+            .aspect_ratio = aspect_ratio,
+            .cl_alpha_per_rad = cl_alpha_per_rad,
+            .cd0 = cd0,
+            .oswald = oswald,
+            .alpha_stall_rad = alpha_stall_rad,
+        } };
+    }
+
+    pub fn components() [6]spec_mod.ComponentSpec {
+        const left: spec_mod.Placement = .{ .position_m = .{ .y = 1.0 } };
+        const right: spec_mod.Placement = .{ .position_m = .{ .y = -1.0 } };
+        return .{
+            .{ .name = "body", .component = .{ .body = .{ .six_dof = .{
+                .mass_kg = mass_kg,
+                .inertia_kg_m2 = .{ .x = 1.0, .y = 2.0, .z = 2.5 },
+            } } } },
+            .{
+                .name = "air",
+                .component = .{ .air = .{ .fixed = .{
+                    .density_kg_m3 = density,
+                    .speed_of_sound_ms = 340.0,
+                } } },
+            },
+            .{
+                .name = "left_station",
+                .component = .{ .airflow = .{ .station = .{} } },
+                .placement = left,
+            },
+            .{ .name = "left_wing", .component = .{ .wing = wingModel() }, .placement = left },
+            .{
+                .name = "right_station",
+                .component = .{ .airflow = .{ .station = .{} } },
+                .placement = right,
+            },
+            .{ .name = "right_wing", .component = .{ .wing = wingModel() }, .placement = right },
+        };
+    }
+
+    pub const connections = [_]spec_mod.ConnectionSpec{
+        .{ .from = "altitude", .to = "air.altitude" },
+        .{ .from = "body.velocity_body", .to = "left_station.velocity_body" },
+        .{ .from = "body.rate_body", .to = "left_station.rate_body" },
+        .{ .from = "body.velocity_body", .to = "right_station.velocity_body" },
+        .{ .from = "body.rate_body", .to = "right_station.rate_body" },
+        .{ .from = "left_station.alpha", .to = "left_wing.alpha" },
+        .{ .from = "left_station.beta", .to = "left_wing.beta" },
+        .{ .from = "left_station.airspeed", .to = "left_wing.airspeed" },
+        .{ .from = "right_station.alpha", .to = "right_wing.alpha" },
+        .{ .from = "right_station.beta", .to = "right_wing.beta" },
+        .{ .from = "right_station.airspeed", .to = "right_wing.airspeed" },
+        .{ .from = "air.density", .to = "left_wing.density" },
+        .{ .from = "air.density", .to = "right_wing.density" },
+        .{ .from = "left_wing.wrench", .to = "body.mount", .attachment = .rigid },
+        .{ .from = "right_wing.wrench", .to = "body.mount", .attachment = .rigid },
+    };
+
+    pub fn spec(comps: *const [6]spec_mod.ComponentSpec) Spec {
+        return .{ .components = comps, .externals = &externals, .connections = &connections };
+    }
+
+    pub const Forces = struct { lift: f64, drag: f64 };
+
+    /// Total lift and drag of both wings at a given alpha and airspeed.
+    pub fn forces(alpha: f64, speed_ms: f64) Forces {
+        const q = 0.5 * density * speed_ms * speed_ms;
+        const cl = cl_alpha_per_rad * alpha;
+        const cd = cd0 + cl * cl / (std.math.pi * oswald * aspect_ratio);
+        return .{
+            .lift = q * area_m2 * cl,
+            .drag = q * area_m2 * cd,
+        };
+    }
+
+    /// Terminal speed in a vertical NED `+z` dive, where drag balances weight at alpha zero.
+    pub fn terminalSpeed() f64 {
+        return @sqrt(2.0 * mass_kg * gravity_m_s2 / (density * area_m2 * cd0));
     }
 };

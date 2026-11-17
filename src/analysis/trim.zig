@@ -1,12 +1,12 @@
 //! Steady-flight trim of a compiled 6-DOF plan.
 //!
 //! A trim point is a state and a set of externals whose body velocity and rate derivatives
-//! vanish. This first version solves the reduced, symmetric case: a level, wings-level
-//! aircraft with an axial thruster, at a fixed speed, with `alpha` and `throttle` as the two
-//! unknowns. `alpha` is a *binding* rather than an external: it writes the body velocity
-//! slots `(V cos a, 0, V sin a)`, the attitude slots `fromEuler(0, a, 0)` and zero rate.
-//! Controls remain externals. Side-force and moment derivatives are not solved; they are
-//! checked to be zero by symmetry in the tests.
+//! vanish. This version solves the reduced, symmetric case: wings-level flight along a given
+//! world direction with an axial thruster and one control external (or an unpowered glider).
+//! `alpha` is a *binding* rather than an external: for path angle `gamma` and speed `V` it
+//! writes body velocity `V (cos a, 0, sin a)` and attitude `yaw(chi) pitch(a - gamma)`.
+//! Controls remain externals; for a glider the second unknown is `V` itself. Side-force and
+//! moment derivatives are not solved; they are checked to be zero by symmetry in the tests.
 //!
 //! Every evaluation copies the plan's initial state and the caller's baseline externals,
 //! applies the bindings, calls `plan.rhs` once, and returns only the selected residual slots.
@@ -28,7 +28,7 @@ pub const Error = error{BadProblem};
 
 /// Which model input one unknown drives.
 pub const Binding = struct {
-    pub const Kind = enum { external, alpha };
+    pub const Kind = enum { external, alpha, speed };
 
     kind: Kind = .external,
     /// External slot, used by `.external`.
@@ -52,6 +52,9 @@ pub const StateMap = struct {
     }
 };
 
+/// Powered flight fixes speed and solves alpha plus a control; a glider solves alpha and speed.
+pub const Mode = enum { powered, glider };
+
 pub const Problem = struct {
     plan: *const Plan,
     ws: *Workspace,
@@ -63,6 +66,12 @@ pub const Problem = struct {
     baseline: []const f64,
     body: StateMap,
     speed_ms: f64,
+    /// World flight direction: `chi` is yaw, `gamma` is the path angle (positive down).
+    chi: f64 = 0.0,
+    gamma: f64 = 0.0,
+    mode: Mode = .powered,
+    control_index: usize = 1,
+    speed_index: usize = 1,
 
     n: usize = 0,
     bindings: [limits.max_unknowns]Binding = @splat(.{}),
@@ -98,8 +107,21 @@ pub const Problem = struct {
         };
     }
 
-    /// The v1 problem: alpha and one control external, against x and z force derivatives.
+    /// Level flight is the special case `gamma = 0`, `chi = 0`.
     pub fn configureLevelFlight(self: *Problem, control_slot: u16, alpha_limit: f64) void {
+        self.configureDirection(.{ .x = 1.0, .y = 0.0, .z = 0.0 }, control_slot, alpha_limit);
+    }
+
+    /// Powered flight along a world direction: alpha and one control are the unknowns.
+    pub fn configureDirection(
+        self: *Problem,
+        direction: base.Vec3,
+        control_slot: u16,
+        alpha_limit: f64,
+    ) void {
+        self.setDirection(direction);
+        self.mode = .powered;
+        self.control_index = 1;
         self.n = 2;
         self.bindings[0] = .{ .kind = .alpha, .lower = -alpha_limit, .upper = alpha_limit };
         self.bindings[1] = .{
@@ -108,8 +130,46 @@ pub const Problem = struct {
             .lower = 0.0,
             .upper = 1.0,
         };
-        self.residual_slots[0] = self.body.velocity;
-        self.residual_slots[1] = self.body.velocity + 2;
+        self.selectForceResiduals();
+    }
+
+    /// Unpowered flight: alpha and speed are the unknowns.
+    pub fn configureGlide(
+        self: *Problem,
+        direction: base.Vec3,
+        alpha_limit: f64,
+        v_min: f64,
+        v_max: f64,
+    ) void {
+        self.setDirection(direction);
+        self.mode = .glider;
+        self.speed_index = 1;
+        self.n = 2;
+        self.bindings[0] = .{ .kind = .alpha, .lower = -alpha_limit, .upper = alpha_limit };
+        self.bindings[1] = .{ .kind = .speed, .lower = v_min, .upper = v_max };
+        self.selectForceResiduals();
+    }
+
+    /// Sets the world direction from a NED vector. `gamma` is positive when descending.
+    pub fn setDirection(self: *Problem, direction: base.Vec3) void {
+        const unit = direction.normalized() orelse {
+            assert(false);
+            return;
+        };
+        self.gamma = std.math.asin(std.math.clamp(unit.z, -1.0, 1.0));
+        self.chi = std.math.atan2(unit.y, unit.x);
+    }
+
+    /// Fixes the speed for a powered problem. Gliders bind speed as an unknown instead.
+    pub fn setSpeed(self: *Problem, speed_ms: f64) void {
+        assert(speed_ms > 0.0 and std.math.isFinite(speed_ms));
+        self.speed_ms = speed_ms;
+    }
+
+    /// Speed interval for a glider binding.
+    pub fn speedBounds(self: *const Problem) struct { lower: f64, upper: f64 } {
+        const bound = self.bindings[self.speed_index];
+        return .{ .lower = bound.lower, .upper = bound.upper };
     }
 
     /// Newton residual. Out-of-bound or non-finite unknowns are `invalid`; the plan's own
@@ -125,12 +185,16 @@ pub const Problem = struct {
 
         @memcpy(self.state, self.plan.initial_state);
         @memcpy(self.externals, self.baseline);
+        // Speed and controls are applied first; alpha closes the flight condition last.
         for (0..self.n) |i| {
-            if (self.bindings[i].kind == .alpha) {
-                self.applyAlpha(x[i]);
-            } else {
-                self.externals[self.bindings[i].slot] = x[i];
+            switch (self.bindings[i].kind) {
+                .external => self.externals[self.bindings[i].slot] = x[i],
+                .speed => self.speed_ms = x[i],
+                .alpha => {},
             }
+        }
+        for (0..self.n) |i| {
+            if (self.bindings[i].kind == .alpha) self.applyAlpha(x[i]);
         }
 
         const validity = self.plan.rhs(self.state, self.externals, self.ws, self.derivatives);
@@ -154,13 +218,19 @@ pub const Problem = struct {
         };
     }
 
+    fn selectForceResiduals(self: *Problem) void {
+        self.residual_slots[0] = self.body.velocity;
+        self.residual_slots[1] = self.body.velocity + 2;
+    }
+
     fn applyAlpha(self: *Problem, alpha: f64) void {
         const v = self.body.velocity;
         self.state[v] = self.speed_ms * @cos(alpha);
         self.state[v + 1] = 0.0;
         self.state[v + 2] = self.speed_ms * @sin(alpha);
 
-        const q = base.Quat.fromEuler(0.0, alpha, 0.0);
+        // Body pitch is alpha minus the path angle, so q.rotate(v_body) follows the direction.
+        const q = base.Quat.fromEuler(0.0, alpha - self.gamma, self.chi);
         const a = self.body.attitude;
         self.state[a] = q.w;
         self.state[a + 1] = q.x;

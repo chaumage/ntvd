@@ -147,7 +147,8 @@ fn evaluate(comptime residual: anytype, ctx: anytype, x: []const f64, r: []f64) 
     };
 }
 
-/// Forward differences: column j is `(r(x + h e_j) - r(x)) / h`.
+/// Forward differences with a backward fallback when a probe leaves the caller's bounds.
+/// Column j is `(r(x + h e_j) - r(x)) / h`, or `(r(x) - r(x - h e_j)) / h` on fallback.
 fn jacobian(
     comptime residual: anytype,
     ctx: anytype,
@@ -162,15 +163,26 @@ fn jacobian(
     for (0..n) |j| {
         const saved = x[j];
         const h = base_step * @max(finite_hint, @abs(saved));
+        var backward = false;
         x[j] = saved + h;
-        const checked = evaluate(residual, ctx, x, probe_r[0..n]);
+        var checked = evaluate(residual, ctx, x, probe_r[0..n]);
+        switch (checked) {
+            .invalid => {
+                backward = true;
+                x[j] = saved - h;
+                checked = evaluate(residual, ctx, x, probe_r[0..n]);
+            },
+            else => {},
+        }
         x[j] = saved;
         switch (checked) {
             .bad => return .bad,
             .invalid => return .invalid,
             .ok => |v| worst = worst.worst(v),
         }
-        for (0..n) |i| a[i][j] = (probe_r[i] - r[i]) / h;
+        for (0..n) |i| {
+            a[i][j] = if (backward) (r[i] - probe_r[i]) / h else (probe_r[i] - r[i]) / h;
+        }
     }
     return .{ .ok = worst };
 }
@@ -384,4 +396,25 @@ test "the same problem gives bit-identical results twice" {
     try std.testing.expectEqualDeep(first, second);
     try std.testing.expectEqualDeep(a, b);
     try std.testing.expectEqualDeep(ar, br);
+}
+
+const UpperBoundRoot = struct {
+    fn residual(self: *const UpperBoundRoot, x: []const f64, r: []f64) Validity {
+        _ = self;
+        if (x[0] < 0.0 or x[0] > 1.0) return .invalid;
+        r[0] = x[0] - 1.0;
+        return .valid;
+    }
+};
+
+test "a root on its bound converges with a backward Jacobian probe" {
+    const system = UpperBoundRoot{};
+    var x = [_]f64{0.999999};
+    var r: [1]f64 = undefined;
+    const options: Options = .{ .tolerance = 1e-12 };
+    const out = solve(UpperBoundRoot.residual, &system, &x, &r, options);
+
+    try std.testing.expectEqual(Status.converged, out.status);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), x[0], 1e-12);
+    try std.testing.expect(out.residual_norm <= 1e-12);
 }

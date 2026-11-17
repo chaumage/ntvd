@@ -90,6 +90,7 @@ aerodynamic rows are pinned by tests in `src/core/components/airflow.zig` and
 | positive yaw rate `r` | nose right | `Quat: positive body rates match the sign table` |
 | force `F = (1, 0, 0)` at `r = (0, 0, -0.4)` (above the CG, z is down) | moment `-y` (`r × F`), nose down | `compile: a rigid wrench at an offset` |
 | gravity at level attitude | body force `(0, 0, +m g)` | `body: gravity is world-down and rotates into the body frame` |
+| envelope path angle `gamma > 0` | world velocity has `+z` (descending); body pitch is `alpha - gamma` | `envelope: glider vertical dive` |
 | positive yaw of 90° | body `+x` maps to world `+y` | `Quat: identity and basis rotations` |
 | positive pitch of 90° | body `+x` maps to world `-z` (up) | `Quat: identity and basis rotations` |
 | positive roll of 90° | body `+y` maps to world `+z` (down) | `Quat: identity and basis rotations` |

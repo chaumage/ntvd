@@ -4,7 +4,9 @@
 //! this one only imports the layers below it (`base`, `model`, `solve`).
 
 pub const trim = @import("trim.zig");
+pub const envelope = @import("envelope.zig");
 
 test {
     _ = @import("trim.zig");
+    _ = @import("envelope.zig");
 }

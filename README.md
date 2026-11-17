@@ -85,8 +85,8 @@ top-level directory, so adding a GUI or a CLI never disturbs the solver.
 | `src/core/base` | L0 | dimensions, units, geometry, lookup tables, linear algebra, rng, atmosphere |
 | `src/core/components` | L1 | the component contract and the physical models |
 | `src/core/model` | L2 | architecture spec, compiler, immutable evaluation plan |
-| `src/core/solve` | L3 | numerical methods acting on a plan (time integration today) |
-| `src/analysis/` | planned | trim points, sweeps, mission segments |
+| `src/core/solve` | L3 | numerical methods acting on a plan (time integration, damped Newton) |
+| `src/analysis/` | L4 | trim points, directional envelope, mission segments |
 | `src/optimize/` | planned | design-variable optimization over analyses |
 | `src/io/` | planned | spec and result file formats |
 | `src/cli/` | planned | command-line front end |
@@ -108,5 +108,6 @@ modules it is given in `build.zig`. The same rule is reserved for the planned la
 ## Status
 
 Early. The skeleton is complete and tested end to end; the physics library is small. See the
-roadmap in `docs/DESIGN.md` for what exists and what is next (trim solver, mission analysis,
-optimizer, file formats, more components).
+roadmap in `docs/DESIGN.md` for what exists and what is next (mission analysis, optimizer, file
+formats, more components). Trim and directional envelope are available; algebraic loops are
+still rejected by the compiler.
